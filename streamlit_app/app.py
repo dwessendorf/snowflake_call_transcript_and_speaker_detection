@@ -350,61 +350,89 @@ def update_call_status(call_id):
                 WHERE call_id = '{call_id}'
             """).collect()
 
+def filter_speakers(speakers, search_term):
+    """Filter speakers by search term"""
+    if not search_term:
+        return speakers
+    search_lower = search_term.lower()
+    return [s for s in speakers if search_lower in (s[1] or '').lower() or search_lower in (s[2] or '').lower()]
+
 # Sidebar - Speaker Management
 st.sidebar.header("👥 Sprecher")
 speakers = get_speakers()
 
 if speakers:
-    st.sidebar.write(f"**{len(speakers)} Sprecher registriert:**")
+    st.sidebar.write(f"**{len(speakers)} Sprecher registriert**")
     
-    # Speaker list with edit option
-    for s in speakers:
-        speaker_id, speaker_name, speaker_email = s[0], s[1], s[2]
+    # Searchable speaker list
+    speaker_search = st.sidebar.text_input(
+        "🔍 Sprecher suchen",
+        placeholder="Name oder E-Mail...",
+        key="sidebar_speaker_search"
+    )
+    
+    filtered_speakers = filter_speakers(speakers, speaker_search)
+    
+    if speaker_search and not filtered_speakers:
+        st.sidebar.info(f"Keine Sprecher gefunden für '{speaker_search}'")
+    elif filtered_speakers:
+        # Show count if filtered
+        if speaker_search:
+            st.sidebar.caption(f"{len(filtered_speakers)} Treffer")
         
-        with st.sidebar.expander(f"📝 {speaker_name}"):
-            # Get full speaker details
-            details = get_speaker_details(speaker_id)
-            if details:
-                _, name, email, dept, company, notes, is_internal = details
-                
-                with st.form(f"edit_speaker_{speaker_id}"):
-                    edit_name = st.text_input("Name *", value=name or "")
-                    edit_email = st.text_input("E-Mail", value=email or "")
-                    edit_dept = st.text_input("Abteilung", value=dept or "")
-                    edit_company = st.text_input("Firma", value=company or "")
-                    edit_notes = st.text_area("Notizen", value=notes or "")
-                    edit_internal = st.checkbox("Intern", value=is_internal if is_internal is not None else True)
+        # Limit display to first 20 for performance
+        display_speakers = filtered_speakers[:20]
+        if len(filtered_speakers) > 20:
+            st.sidebar.caption(f"Zeige erste 20 von {len(filtered_speakers)}")
+        
+        # Speaker list with edit option
+        for s in display_speakers:
+            speaker_id, speaker_name, speaker_email = s[0], s[1], s[2]
+            
+            with st.sidebar.expander(f"📝 {speaker_name}"):
+                # Get full speaker details
+                details = get_speaker_details(speaker_id)
+                if details:
+                    _, name, email, dept, company, notes, is_internal = details
                     
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        save_btn = st.form_submit_button("💾 Speichern")
-                    with col2:
-                        delete_btn = st.form_submit_button("🗑️ Löschen")
-                    
-                    if save_btn:
-                        if edit_name:
-                            success = update_speaker(
-                                speaker_id,
-                                edit_name,
-                                edit_email if edit_email else None,
-                                edit_dept if edit_dept else None,
-                                edit_company if edit_company else None,
-                                edit_notes if edit_notes else None,
-                                edit_internal
-                            )
+                    with st.form(f"edit_speaker_{speaker_id}"):
+                        edit_name = st.text_input("Name *", value=name or "")
+                        edit_email = st.text_input("E-Mail", value=email or "")
+                        edit_dept = st.text_input("Abteilung", value=dept or "")
+                        edit_company = st.text_input("Firma", value=company or "")
+                        edit_notes = st.text_area("Notizen", value=notes or "")
+                        edit_internal = st.checkbox("Intern", value=is_internal if is_internal is not None else True)
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            save_btn = st.form_submit_button("💾 Speichern")
+                        with col2:
+                            delete_btn = st.form_submit_button("🗑️ Löschen")
+                        
+                        if save_btn:
+                            if edit_name:
+                                success = update_speaker(
+                                    speaker_id,
+                                    edit_name,
+                                    edit_email if edit_email else None,
+                                    edit_dept if edit_dept else None,
+                                    edit_company if edit_company else None,
+                                    edit_notes if edit_notes else None,
+                                    edit_internal
+                                )
+                                if success:
+                                    st.success("✅ Gespeichert!")
+                                    st.rerun()
+                            else:
+                                st.error("Name ist erforderlich")
+                        
+                        if delete_btn:
+                            success, error = delete_speaker(speaker_id)
                             if success:
-                                st.success("✅ Gespeichert!")
-                                st.experimental_rerun()
-                        else:
-                            st.error("Name ist erforderlich")
-                    
-                    if delete_btn:
-                        success, error = delete_speaker(speaker_id)
-                        if success:
-                            st.success("✅ Gelöscht!")
-                            st.experimental_rerun()
-                        else:
-                            st.error(f"❌ {error}")
+                                st.success("✅ Gelöscht!")
+                                st.rerun()
+                            else:
+                                st.error(f"❌ {error}")
 
 st.sidebar.divider()
 st.sidebar.subheader("➕ Neuen Sprecher anlegen")
@@ -428,7 +456,7 @@ with st.sidebar.form("new_speaker"):
             )
             if speaker_id:
                 st.sidebar.success(f"✅ {new_name} angelegt!")
-                st.experimental_rerun()
+                st.rerun()
         else:
             st.sidebar.error("Name ist erforderlich")
 
@@ -566,9 +594,14 @@ else:
         st.subheader("🎯 Sprecher zuordnen")
         st.caption(f"Schwellenwert für Auto-Matching: {SIMILARITY_THRESHOLD:.0%}")
         
-        # Refresh speakers list
+        # Refresh speakers list and create searchable options
         speakers = get_speakers()
-        speaker_options = [(None, "-- Nicht zugeordnet --")] + [(s[0], s[1]) for s in speakers]
+        speaker_names = ["-- Nicht zugeordnet --"] + [s[1] for s in speakers]
+        speaker_ids = [None] + [s[0] for s in speakers]
+        
+        # Create a mapping for quick lookup
+        speaker_name_to_id = {s[1]: s[0] for s in speakers}
+        speaker_id_to_name = {s[0]: s[1] for s in speakers}
         
         assignments_made = 0
         total_groups = len(groups)
@@ -620,36 +653,32 @@ else:
                         sample = (group[3] or "")[:400]
                         st.caption(f"*\"{sample}...\"*" if len(sample) >= 400 else f"*\"{sample}\"*")
                     
-                    # Find current speaker index
-                    current_idx = 0
-                    if current_speaker:
-                        for i, (sid, sname) in enumerate(speaker_options):
-                            if sid == current_speaker:
-                                current_idx = i
-                                break
-                    
+                    # Searchable speaker selection
                     col_select, col_button, col_delete = st.columns([3, 1, 1])
                     
                     with col_select:
-                        selected = st.selectbox(
+                        # Get current speaker name for default
+                        current_speaker_name = speaker_id_to_name.get(current_speaker, "-- Nicht zugeordnet --") if current_speaker else "-- Nicht zugeordnet --"
+                        
+                        # Use selectbox with search capability
+                        selected_speaker_name = st.selectbox(
                             f"Sprecher für {label}",
-                            range(len(speaker_options)),
-                            index=current_idx,
-                            format_func=lambda i: speaker_options[i][1],
+                            options=speaker_names,
+                            index=speaker_names.index(current_speaker_name) if current_speaker_name in speaker_names else 0,
                             key=f"speaker_{label}",
                             label_visibility="collapsed"
                         )
+                        
+                        # Get the speaker ID from the selected name
+                        new_speaker_id = speaker_name_to_id.get(selected_speaker_name) if selected_speaker_name != "-- Nicht zugeordnet --" else None
                     
                     with col_button:
-                        new_speaker_id = speaker_options[selected][0]
-                        new_speaker_name = speaker_options[selected][1] if selected > 0 else ""
-                        
                         if new_speaker_id and new_speaker_id != current_speaker:
                             if st.button(f"✓ Zuordnen", key=f"assign_{label}"):
                                 with st.spinner(f"Verarbeite {label}... (Embedding-Extraktion kann dauern)"):
                                     # Use enhanced matching
                                     result = assign_speaker_with_matching(
-                                        call_id, label, new_speaker_id, new_speaker_name, SIMILARITY_THRESHOLD
+                                        call_id, label, new_speaker_id, selected_speaker_name, SIMILARITY_THRESHOLD
                                     )
                                     
                                     if result['success']:
@@ -674,7 +703,7 @@ else:
                                         
                                         st.success(msg)
                                         update_call_status(call_id)
-                                        st.experimental_rerun()
+                                        st.rerun()
                                     else:
                                         errors = ", ".join(result['errors']) if result['errors'] else "Unbekannter Fehler"
                                         st.error(f"Zuordnung fehlgeschlagen: {errors}")
@@ -696,13 +725,13 @@ else:
                                 st.success(message)
                                 del st.session_state[f'confirm_delete_{label}']
                                 update_call_status(call_id)
-                                st.experimental_rerun()
+                                st.rerun()
                             else:
                                 st.error(f"Fehler: {message}")
                     with confirm_col2:
                         if st.button("✗ Nein", key=f"confirm_no_{label}"):
                             del st.session_state[f'confirm_delete_{label}']
-                            st.experimental_rerun()
+                            st.rerun()
                 
                 st.divider()
         
@@ -713,7 +742,7 @@ else:
         if assignments_made == total_groups:
             st.success("✅ Alle Sprecher zugeordnet! Call ist bereit für den Export.")
             if st.button("🔄 Seite aktualisieren"):
-                st.experimental_rerun()
+                st.rerun()
 
 # Footer
 st.markdown("---")
