@@ -15,66 +15,50 @@ from snowflake.snowpark.context import get_active_session
 
 st.set_page_config(page_title="Speaker Classification", page_icon="🎤", layout="wide")
 
-st.title("🎤 Speaker Classification")
+# Get Snowpark session (works in Streamlit-in-Snowflake)
+session = get_active_session()
 
 # Configuration
 SIMILARITY_THRESHOLD = 0.75  # Threshold for auto-matching
 
-# Get Snowpark session (works in Streamlit-in-Snowflake)
-session = get_active_session()
+# =============================================================================
+# CACHED QUERY FUNCTIONS - Use caching to avoid repeated queries
+# =============================================================================
 
-def run_query(sql):
-    """Execute SQL and return results as list of tuples"""
-    return session.sql(sql).collect()
-
-def run_query_df(sql):
-    """Execute SQL and return results as pandas DataFrame"""
-    return session.sql(sql).to_pandas()
-
-def get_audio_url(call_id):
-    """Get presigned URL for call audio"""
-    try:
-        result = run_query(f"SELECT recording_path FROM CALLS WHERE call_id = '{call_id}'")
-        if not result or not result[0][0]:
-            return None
-        recording_path = result[0][0]
-        # Parse stage and path
-        if recording_path.startswith('@'):
-            recording_path = recording_path[1:]
-        parts = recording_path.split('/')
-        stage_name = parts[0] if '.' in parts[0] else f"@{parts[0]}"
-        file_path = '/'.join(parts[1:]) if len(parts) > 1 else parts[0]
-        
-        url_result = run_query(f"SELECT GET_PRESIGNED_URL(@{parts[0]}, '{file_path}', 3600) as url")
-        return url_result[0][0] if url_result else None
-    except Exception as e:
-        return None
-
-def get_calls(only_incomplete=True):
-    """Get calls, optionally filtered to only incomplete ones"""
-    filter_clause = "WHERE classification_status != 'completed'" if only_incomplete else ""
-    results = run_query(f"""
-        SELECT call_id, title, call_date, classification_status,
-               (SELECT COUNT(*) FROM CALL_CONTRIBUTIONS WHERE call_id = m.call_id) as total_contributions,
-               (SELECT COUNT(DISTINCT diarization_label) FROM CALL_CONTRIBUTIONS WHERE call_id = m.call_id) as speaker_count
-        FROM CALLS m
-        {filter_clause}
-        ORDER BY call_date DESC
-    """)
-    return [(r[0], r[1], r[2], r[3], r[4], r[5]) for r in results]
-
-def get_speakers():
-    """Get all registered speakers, sorted by meeting count descending"""
-    results = run_query("""
+@st.cache_data(ttl=60)  # Cache for 60 seconds
+def get_speakers_cached():
+    """Get all registered speakers, sorted by meeting count descending - CACHED"""
+    results = session.sql("""
         SELECT speaker_id, display_name, email, COALESCE(meeting_count, 0) as meeting_count 
         FROM SPEAKERS 
         ORDER BY meeting_count DESC, display_name ASC
-    """)
+    """).collect()
     return [(r[0], r[1], r[2], r[3]) for r in results]
 
-def get_diarization_groups(call_id):
-    """Get contributions grouped by diarization label"""
-    results = run_query(f"""
+@st.cache_data(ttl=30)  # Cache for 30 seconds
+def get_calls_cached(only_incomplete=True):
+    """Get calls - CACHED"""
+    filter_clause = "WHERE classification_status != 'completed'" if only_incomplete else ""
+    results = session.sql(f"""
+        SELECT m.call_id, m.title, m.call_date, m.classification_status,
+               c.total_contributions, c.speaker_count
+        FROM CALLS m
+        LEFT JOIN (
+            SELECT call_id, 
+                   COUNT(*) as total_contributions,
+                   COUNT(DISTINCT diarization_label) as speaker_count
+            FROM CALL_CONTRIBUTIONS
+            GROUP BY call_id
+        ) c ON m.call_id = c.call_id
+        {filter_clause}
+        ORDER BY m.call_date DESC
+    """).collect()
+    return [(r[0], r[1], r[2], r[3], r[4] or 0, r[5] or 0) for r in results]
+
+@st.cache_data(ttl=30)
+def get_diarization_groups_cached(call_id):
+    """Get contributions grouped by diarization label - CACHED"""
+    results = session.sql(f"""
         SELECT 
             diarization_label,
             COUNT(*) as segment_count,
@@ -85,12 +69,54 @@ def get_diarization_groups(call_id):
         WHERE call_id = '{call_id}'
         GROUP BY diarization_label
         ORDER BY MIN(segment_number)
-    """)
+    """).collect()
     return [(r[0], r[1], r[2], r[3], r[4]) for r in results]
+
+@st.cache_data(ttl=60)
+def get_embedding_counts_cached():
+    """Get embedding counts - CACHED"""
+    try:
+        result = session.sql("""
+            SELECT 
+                (SELECT COUNT(*) FROM CONTRIBUTION_EMBEDDINGS) as stored,
+                (SELECT COUNT(*) FROM CALL_CONTRIBUTIONS 
+                 WHERE identified_speaker_id IS NULL 
+                 AND duration_seconds >= 5.0
+                 AND contribution_id NOT IN (SELECT contribution_id FROM CONTRIBUTION_EMBEDDINGS)) as pending
+        """).collect()
+        return result[0][0] or 0, result[0][1] or 0
+    except:
+        return 0, 0
+
+@st.cache_data(ttl=300)  # Cache audio URL for 5 minutes
+def get_audio_url_cached(call_id):
+    """Get presigned URL for call audio - CACHED"""
+    try:
+        result = session.sql(f"SELECT recording_path FROM CALLS WHERE call_id = '{call_id}'").collect()
+        if not result or not result[0][0]:
+            return None
+        recording_path = result[0][0]
+        if recording_path.startswith('@'):
+            recording_path = recording_path[1:]
+        parts = recording_path.split('/')
+        file_path = '/'.join(parts[1:]) if len(parts) > 1 else parts[0]
+        
+        url_result = session.sql(f"SELECT GET_PRESIGNED_URL(@{parts[0]}, '{file_path}', 3600) as url").collect()
+        return url_result[0][0] if url_result else None
+    except:
+        return None
+
+# =============================================================================
+# NON-CACHED FUNCTIONS - For data that changes frequently or needs fresh data
+# =============================================================================
+
+def run_query(sql):
+    """Execute SQL and return results as list of tuples"""
+    return session.sql(sql).collect()
 
 def get_segments_for_label(call_id, diarization_label):
     """Get individual segments for a diarization label"""
-    results = run_query(f"""
+    results = session.sql(f"""
         SELECT 
             contribution_id,
             segment_number,
@@ -101,26 +127,8 @@ def get_segments_for_label(call_id, diarization_label):
         WHERE call_id = '{call_id}'
         AND diarization_label = '{diarization_label}'
         ORDER BY segment_number
-    """)
+    """).collect()
     return [(r[0], r[1], r[2], r[3], r[4]) for r in results]
-
-def compute_similarity(embedding1, embedding2):
-    """Compute cosine similarity between two embeddings"""
-    if not embedding1 or not embedding2:
-        return 0.0
-    
-    arr1 = np.array(embedding1)
-    arr2 = np.array(embedding2)
-    
-    # Cosine similarity
-    dot_product = np.dot(arr1, arr2)
-    norm1 = np.linalg.norm(arr1)
-    norm2 = np.linalg.norm(arr2)
-    
-    if norm1 == 0 or norm2 == 0:
-        return 0.0
-    
-    return dot_product / (norm1 * norm2)
 
 def extract_embedding_via_procedure(call_id, contribution_id):
     """Extract embedding using the Snowflake procedure"""
@@ -152,14 +160,11 @@ def increment_speaker_meeting_count(speaker_id):
             WHERE speaker_id = '{speaker_id}'
         """).collect()
         return True
-    except Exception as e:
+    except:
         return False
 
 def match_voiceprint_against_embeddings(speaker_id, source_call_id, threshold=0.75):
-    """
-    Match a speaker's voiceprint against pre-computed embeddings in other calls.
-    Returns dict with match results.
-    """
+    """Match a speaker's voiceprint against pre-computed embeddings in other calls."""
     try:
         results = run_query(f"""
             CALL MATCH_VOICEPRINT_AGAINST_EMBEDDINGS('{speaker_id}', '{source_call_id}', {threshold})
@@ -173,51 +178,9 @@ def match_voiceprint_against_embeddings(speaker_id, source_call_id, threshold=0.
     except Exception as e:
         return {'errors': [str(e)]}
 
-def precompute_call_embeddings(call_id):
-    """
-    Pre-compute embeddings for all unassigned contributions in a call.
-    Should be called after transcription completes.
-    """
-    try:
-        results = run_query(f"CALL PRECOMPUTE_CALL_EMBEDDINGS('{call_id}')")
-        if results and results[0][0]:
-            data = results[0][0]
-            if isinstance(data, str):
-                data = json.loads(data)
-            return data
-        return {'message': 'No result from precompute procedure'}
-    except Exception as e:
-        return {'errors': [str(e)]}
-
-def get_pending_embeddings_count():
-    """Get count of contributions waiting for embedding computation"""
-    try:
-        result = run_query("""
-            SELECT COUNT(*) FROM CALL_CONTRIBUTIONS cc
-            WHERE cc.identified_speaker_id IS NULL
-            AND cc.duration_seconds >= 5.0
-            AND cc.contribution_id NOT IN (SELECT contribution_id FROM CONTRIBUTION_EMBEDDINGS)
-        """)
-        return result[0][0] if result else 0
-    except:
-        return 0
-
-def get_stored_embeddings_count():
-    """Get count of pre-computed embeddings available for matching"""
-    try:
-        result = run_query("SELECT COUNT(*) FROM CONTRIBUTION_EMBEDDINGS")
-        return result[0][0] if result else 0
-    except:
-        return 0
-
 def assign_speaker_with_matching(call_id, diarization_label, speaker_id, speaker_name, threshold):
-    """
-    Assign a speaker to a diarization label.
-    Only extracts embeddings for segments >= 5 seconds.
-    Shorter segments are assigned without embedding extraction.
-    Also increments the speaker's meeting count.
-    """
-    MIN_DURATION_FOR_EMBEDDING = 5.0  # seconds
+    """Assign a speaker to a diarization label."""
+    MIN_DURATION_FOR_EMBEDDING = 5.0
     
     results = {
         'success': False,
@@ -231,7 +194,7 @@ def assign_speaker_with_matching(call_id, diarization_label, speaker_id, speaker
     }
     
     try:
-        # Check if this speaker was already assigned to this call (to avoid double-counting)
+        # Check if speaker already in call
         existing = run_query(f"""
             SELECT COUNT(*) FROM CALL_CONTRIBUTIONS
             WHERE call_id = '{call_id}' 
@@ -240,7 +203,7 @@ def assign_speaker_with_matching(call_id, diarization_label, speaker_id, speaker
         """)
         speaker_already_in_call = existing[0][0] > 0 if existing else False
         
-        # Get all contributions for this label with their durations
+        # Get contributions for this label
         contributions = run_query(f"""
             SELECT contribution_id, duration_seconds
             FROM CALL_CONTRIBUTIONS
@@ -254,30 +217,22 @@ def assign_speaker_with_matching(call_id, diarization_label, speaker_id, speaker
             return results
         
         total_count = len(contributions)
-        
-        # Find the longest segment >= 5 seconds for embedding extraction
         long_segments = [(c[0], c[1]) for c in contributions if (c[1] or 0) >= MIN_DURATION_FOR_EMBEDDING]
         short_segments = [(c[0], c[1]) for c in contributions if (c[1] or 0) < MIN_DURATION_FOR_EMBEDDING]
         
         results['skipped_short'] = len(short_segments)
         
-        # Try to extract embedding from the longest segment (if any are long enough)
+        # Extract embedding from longest segment
         if long_segments:
-            # Sort by duration descending to get the longest
             long_segments.sort(key=lambda x: x[1] or 0, reverse=True)
             best_contribution_id = long_segments[0][0]
-            best_duration = long_segments[0][1]
-            
-            # Extract embedding for the longest segment
             embedding, error = extract_embedding_via_procedure(call_id, best_contribution_id)
             if embedding:
                 results['embedding_extracted'] = True
-                # Could save voiceprint here if needed in the future
-                results['voiceprint_saved'] = False
             elif error:
                 results['errors'].append(f"Embedding extraction: {error}")
         
-        # Assign speaker to ALL contributions with this diarization label
+        # Assign speaker
         session.sql(f"""
             UPDATE CALL_CONTRIBUTIONS
             SET identified_speaker_id = '{speaker_id}',
@@ -288,21 +243,21 @@ def assign_speaker_with_matching(call_id, diarization_label, speaker_id, speaker
             AND diarization_label = '{diarization_label}'
         """).collect()
         
-        # Remove from classification queue
+        # Remove from queue
         session.sql(f"""
             DELETE FROM CLASSIFICATION_QUEUE 
             WHERE call_id = '{call_id}'
             AND diarization_label = '{diarization_label}'
         """).collect()
         
-        # Increment meeting count only if this is the first time this speaker appears in this call
+        # Increment meeting count
         if not speaker_already_in_call:
             increment_speaker_meeting_count(speaker_id)
         
         results['success'] = True
         results['auto_classified'] = total_count
         
-        # Background matching: match this speaker against pre-computed embeddings in other calls
+        # Background matching
         try:
             match_result = match_voiceprint_against_embeddings(speaker_id, call_id, threshold)
             if match_result.get('contributions_updated', 0) > 0:
@@ -313,6 +268,10 @@ def assign_speaker_with_matching(call_id, diarization_label, speaker_id, speaker
         except Exception as e:
             results['errors'].append(f"Background matching: {str(e)}")
         
+        # Clear caches after assignment
+        get_diarization_groups_cached.clear()
+        get_speakers_cached.clear()
+        
         return results
         
     except Exception as e:
@@ -320,9 +279,8 @@ def assign_speaker_with_matching(call_id, diarization_label, speaker_id, speaker
         return results
 
 def delete_contributions(call_id, diarization_label):
-    """Delete all contributions for a specific diarization label from a call"""
+    """Delete all contributions for a specific diarization label"""
     try:
-        # Get count first
         count_result = run_query(f"""
             SELECT COUNT(*) FROM CALL_CONTRIBUTIONS
             WHERE call_id = '{call_id}' 
@@ -333,20 +291,19 @@ def delete_contributions(call_id, diarization_label):
         if count == 0:
             return False, "Keine Beiträge gefunden"
         
-        # Delete from classification queue first
         session.sql(f"""
             DELETE FROM CLASSIFICATION_QUEUE 
             WHERE call_id = '{call_id}'
             AND diarization_label = '{diarization_label}'
         """).collect()
         
-        # Delete contributions
         session.sql(f"""
             DELETE FROM CALL_CONTRIBUTIONS
             WHERE call_id = '{call_id}' 
             AND diarization_label = '{diarization_label}'
         """).collect()
         
+        get_diarization_groups_cached.clear()
         return True, f"{count} Beiträge gelöscht"
     except Exception as e:
         return False, str(e)
@@ -356,7 +313,6 @@ def create_speaker(name, email=None, department=None, company=None, notes=None, 
     speaker_id = f"SPK_{uuid.uuid4().hex[:16]}"
     
     try:
-        # Build insert with proper escaping
         name_escaped = name.replace("'", "''")
         email_val = f"'{email}'" if email else 'NULL'
         dept_val = f"'{department}'" if department else 'NULL'
@@ -367,6 +323,7 @@ def create_speaker(name, email=None, department=None, company=None, notes=None, 
             INSERT INTO SPEAKERS (speaker_id, display_name, email, department, company, notes, is_internal, meeting_count, created_at, updated_at, created_by)
             VALUES ('{speaker_id}', '{name_escaped}', {email_val}, {dept_val}, {company_val}, {notes_val}, TRUE, {meeting_count}, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_USER())
         """).collect()
+        get_speakers_cached.clear()
         return speaker_id
     except Exception as e:
         st.error(f"Error creating speaker: {e}")
@@ -387,7 +344,6 @@ def get_speaker_details(speaker_id):
 def update_speaker(speaker_id, name, email=None, department=None, company=None, notes=None, is_internal=True, meeting_count=None):
     """Update an existing speaker"""
     try:
-        # Build update with proper escaping
         name_escaped = name.replace("'", "''")
         email_val = f"'{email}'" if email else 'NULL'
         dept_val = f"'{department}'" if department else 'NULL'
@@ -395,7 +351,6 @@ def update_speaker(speaker_id, name, email=None, department=None, company=None, 
         notes_escaped = notes.replace("'", "''") if notes else None
         notes_val = f"'{notes_escaped}'" if notes_escaped else 'NULL'
         internal_val = 'TRUE' if is_internal else 'FALSE'
-        
         meeting_count_sql = f", meeting_count = {meeting_count}" if meeting_count is not None else ""
         
         session.sql(f"""
@@ -410,15 +365,15 @@ def update_speaker(speaker_id, name, email=None, department=None, company=None, 
                 {meeting_count_sql}
             WHERE speaker_id = '{speaker_id}'
         """).collect()
+        get_speakers_cached.clear()
         return True
     except Exception as e:
         st.error(f"Error updating speaker: {e}")
         return False
 
 def delete_speaker(speaker_id):
-    """Delete a speaker (only if not used in any calls)"""
+    """Delete a speaker (only if not used)"""
     try:
-        # Check if speaker is used in any contributions
         count_result = run_query(f"""
             SELECT COUNT(*) FROM CALL_CONTRIBUTIONS
             WHERE identified_speaker_id = '{speaker_id}'
@@ -428,15 +383,14 @@ def delete_speaker(speaker_id):
         if count > 0:
             return False, f"Sprecher wird in {count} Beiträgen verwendet"
         
-        # Delete speaker
         session.sql(f"DELETE FROM SPEAKERS WHERE speaker_id = '{speaker_id}'").collect()
+        get_speakers_cached.clear()
         return True, None
     except Exception as e:
         return False, str(e)
 
 def update_call_status(call_id):
     """Update call status based on classification progress"""
-    # Check if all contributions are classified (either manually or auto)
     results = run_query(f"""
         SELECT 
             COUNT(*) as total,
@@ -452,6 +406,7 @@ def update_call_status(call_id):
                 UPDATE CALLS SET classification_status = 'completed'
                 WHERE call_id = '{call_id}'
             """).collect()
+            get_calls_cached.clear()
 
 def filter_speakers(speakers, search_term):
     """Filter speakers by search term"""
@@ -461,22 +416,17 @@ def filter_speakers(speakers, search_term):
     return [s for s in speakers if search_lower in (s[1] or '').lower() or search_lower in (s[2] or '').lower()]
 
 def import_speakers_from_csv(csv_content):
-    """Import speakers from CSV content. Expected columns: name, email, department, company, meeting_count"""
+    """Import speakers from CSV content"""
     try:
         df = pd.read_csv(io.StringIO(csv_content))
-        
-        # Normalize column names
         df.columns = df.columns.str.lower().str.strip()
         
         if 'name' not in df.columns and 'display_name' not in df.columns:
             return False, "CSV muss eine 'name' oder 'display_name' Spalte haben"
         
-        # Use display_name if name is not present
         name_col = 'name' if 'name' in df.columns else 'display_name'
-        
         imported = 0
         updated = 0
-        errors = []
         
         for idx, row in df.iterrows():
             name = str(row[name_col]).strip() if pd.notna(row[name_col]) else None
@@ -488,7 +438,6 @@ def import_speakers_from_csv(csv_content):
             company = str(row.get('company', '')).strip() if pd.notna(row.get('company')) else None
             meeting_count = int(row.get('meeting_count', 0)) if pd.notna(row.get('meeting_count')) else 0
             
-            # Check if speaker already exists by email or name
             existing = None
             if email:
                 existing = run_query(f"SELECT speaker_id FROM SPEAKERS WHERE email = '{email}'")
@@ -498,32 +447,38 @@ def import_speakers_from_csv(csv_content):
             
             try:
                 if existing:
-                    # Update existing speaker
                     speaker_id = existing[0][0]
                     update_speaker(speaker_id, name, email, department, company, None, True, meeting_count)
                     updated += 1
                 else:
-                    # Create new speaker
                     create_speaker(name, email, department, company, None, meeting_count)
                     imported += 1
-            except Exception as e:
-                errors.append(f"Zeile {idx+1}: {str(e)}")
+            except:
+                pass
         
-        msg = f"✅ {imported} neu importiert, {updated} aktualisiert"
-        if errors:
-            msg += f"\n⚠️ {len(errors)} Fehler"
-        return True, msg
+        get_speakers_cached.clear()
+        return True, f"✅ {imported} neu importiert, {updated} aktualisiert"
     except Exception as e:
         return False, f"CSV-Fehler: {str(e)}"
 
-# Sidebar - Speaker Management
+# =============================================================================
+# UI - TITLE
+# =============================================================================
+
+st.title("🎤 Speaker Classification")
+
+# =============================================================================
+# SIDEBAR - Speaker Management
+# =============================================================================
+
 st.sidebar.header("👥 Sprecher")
-speakers = get_speakers()
+
+# Load speakers once (cached)
+speakers = get_speakers_cached()
 
 if speakers:
     st.sidebar.write(f"**{len(speakers)} Sprecher registriert**")
     
-    # Searchable speaker list
     speaker_search = st.sidebar.text_input(
         "🔍 Sprecher suchen",
         placeholder="Name oder E-Mail...",
@@ -535,21 +490,18 @@ if speakers:
     if speaker_search and not filtered_speakers:
         st.sidebar.info(f"Keine Sprecher gefunden für '{speaker_search}'")
     elif filtered_speakers:
-        # Show count if filtered
         if speaker_search:
             st.sidebar.caption(f"{len(filtered_speakers)} Treffer")
         
-        # Limit display to first 20 for performance
-        display_speakers = filtered_speakers[:20]
-        if len(filtered_speakers) > 20:
-            st.sidebar.caption(f"Zeige erste 20 von {len(filtered_speakers)}")
+        # Only show first 10 for performance
+        display_speakers = filtered_speakers[:10]
+        if len(filtered_speakers) > 10:
+            st.sidebar.caption(f"Zeige erste 10 von {len(filtered_speakers)}")
         
-        # Speaker list with edit option - show meeting count
         for s in display_speakers:
             speaker_id, speaker_name, speaker_email, meeting_count = s[0], s[1], s[2], s[3]
             
             with st.sidebar.expander(f"📝 {speaker_name} ({meeting_count})"):
-                # Get full speaker details
                 details = get_speaker_details(speaker_id)
                 if details:
                     _, name, email, dept, company, notes, is_internal, mtg_count = details
@@ -572,14 +524,12 @@ if speakers:
                         if save_btn:
                             if edit_name:
                                 success = update_speaker(
-                                    speaker_id,
-                                    edit_name,
+                                    speaker_id, edit_name,
                                     edit_email if edit_email else None,
                                     edit_dept if edit_dept else None,
                                     edit_company if edit_company else None,
                                     edit_notes if edit_notes else None,
-                                    edit_internal,
-                                    edit_meeting_count
+                                    edit_internal, edit_meeting_count
                                 )
                                 if success:
                                     st.success("✅ Gespeichert!")
@@ -597,7 +547,7 @@ if speakers:
 
 st.sidebar.divider()
 
-# CSV Import - using text area instead of file_uploader (not supported in SiS 1.22)
+# CSV Import
 st.sidebar.subheader("📤 CSV Import")
 with st.sidebar.expander("CSV einfügen"):
     st.caption("Spalten: name, email, department, company, meeting_count")
@@ -660,8 +610,7 @@ SIMILARITY_THRESHOLD = threshold
 # Background Matching Info
 st.sidebar.divider()
 st.sidebar.subheader("🔄 Auto-Matching")
-stored_embeddings = get_stored_embeddings_count()
-pending_embeddings = get_pending_embeddings_count()
+stored_embeddings, pending_embeddings = get_embedding_counts_cached()
 st.sidebar.metric("Gespeicherte Embeddings", stored_embeddings)
 st.sidebar.metric("Wartende Beiträge", pending_embeddings)
 if pending_embeddings > 0:
@@ -669,7 +618,10 @@ if pending_embeddings > 0:
 else:
     st.sidebar.caption("✅ Alle Embeddings berechnet")
 
-# Main content
+# =============================================================================
+# MAIN CONTENT
+# =============================================================================
+
 # Initialize filter state
 if 'show_only_incomplete' not in st.session_state:
     st.session_state.show_only_incomplete = True
@@ -688,7 +640,7 @@ with filter_col2:
     )
     st.session_state.show_only_incomplete = (show_filter == "Nur unvollständige")
 
-calls = get_calls(only_incomplete=st.session_state.show_only_incomplete)
+calls = get_calls_cached(only_incomplete=st.session_state.show_only_incomplete)
 
 if not calls:
     if st.session_state.show_only_incomplete:
@@ -701,14 +653,13 @@ else:
     if 'selected_call_id' not in st.session_state:
         st.session_state.selected_call_id = calls[0][0]
     
-    # Find current index based on stored call_id
+    # Find current index
     current_idx = 0
     for i, m in enumerate(calls):
         if m[0] == st.session_state.selected_call_id:
             current_idx = i
             break
     
-    # If stored call not in current list, reset to first
     if current_idx == 0 and calls[0][0] != st.session_state.selected_call_id:
         st.session_state.selected_call_id = calls[0][0]
     
@@ -722,9 +673,7 @@ else:
         key="call_selector"
     )
     
-    # Update session state when selection changes
     st.session_state.selected_call_id = calls[selected_idx][0]
-    
     selected_call = calls[selected_idx]
     call_id = selected_call[0]
     
@@ -738,16 +687,15 @@ else:
     
     st.divider()
     
-    # Get diarization groups
-    groups = get_diarization_groups(call_id)
+    # Get diarization groups (cached)
+    groups = get_diarization_groups_cached(call_id)
     
     if not groups:
         st.warning("Keine Beiträge für dieses Call gefunden.")
     else:
-        # Build ONE HTML component with audio player + all seek buttons
-        audio_url = get_audio_url(call_id)
+        # Audio player
+        audio_url = get_audio_url_cached(call_id)
         if audio_url:
-            # Build buttons for each speaker group
             buttons_html = ""
             for group in groups:
                 label = group[0]
@@ -778,7 +726,6 @@ else:
                     audioElement.currentTime = seconds;
                     audioElement.play();
                 }}
-                // Expose seekTo to parent window for cross-iframe communication
                 window.parent.seekAudioTo = function(seconds) {{
                     audioElement.currentTime = seconds;
                     audioElement.play();
@@ -790,13 +737,8 @@ else:
         st.subheader("🎯 Sprecher zuordnen")
         st.caption(f"Schwellenwert für Auto-Matching: {SIMILARITY_THRESHOLD:.0%}")
         
-        # Refresh speakers list and create searchable options (already sorted by meeting_count desc)
-        speakers = get_speakers()
-        # Format: "Name (count)" for display, sorted by meeting_count desc
+        # Speaker options (use cached speakers)
         speaker_names = ["-- Nicht zugeordnet --"] + [f"{s[1]} ({s[3]})" for s in speakers]
-        speaker_ids = [None] + [s[0] for s in speakers]
-        
-        # Create mappings for quick lookup
         speaker_display_to_id = {f"{s[1]} ({s[3]})": s[0] for s in speakers}
         speaker_id_to_display = {s[0]: f"{s[1]} ({s[3]})" for s in speakers}
         
@@ -809,10 +751,8 @@ else:
             duration = group[2] or 0
             current_speaker = group[4]
             
-            # Get segments for this group
             segments = get_segments_for_label(call_id, label) if audio_url else []
             
-            # Check if already assigned
             is_assigned = current_speaker is not None
             if is_assigned:
                 assignments_made += 1
@@ -828,36 +768,15 @@ else:
                     st.caption(f"{count} Segmente · {duration:.0f}s")
                 
                 with col2:
-                    # Show clickable contribution texts
-                    if audio_url and segments:
-                        # Build clickable text links for each segment
-                        text_links = []
-                        for seg in segments:
-                            seg_start = seg[2] or 0
-                            seg_text = (seg[4] or "")[:100]
-                            if seg_text:
-                                start_fmt = f"{int(seg_start//60)}:{int(seg_start%60):02d}"
-                                text_links.append(f'<a href="#" onclick="window.parent.seekAudioTo({seg_start}); return false;" style="color: #555; text-decoration: underline; text-decoration-style: dotted;" title="▶️ {start_fmt}">{seg_text}</a>')
-                        
-                        if text_links:
-                            links_html = f"""
-                            <div style="font-size: 13px; line-height: 1.6; font-style: italic; color: #666;">
-                                "{' <span style="color: #ccc;">|</span> '.join(text_links)}..."
-                            </div>
-                            """
-                            components.html(links_html, height=60 + (len(segments) // 3) * 20)
-                    else:
-                        sample = (group[3] or "")[:400]
-                        st.caption(f"*\"{sample}...\"*" if len(sample) >= 400 else f"*\"{sample}\"*")
+                    # Sample text
+                    sample = (group[3] or "")[:300]
+                    st.caption(f"*\"{sample}...\"*" if len(sample) >= 300 else f"*\"{sample}\"*")
                     
-                    # Searchable speaker selection (already sorted by meeting count)
                     col_select, col_button, col_delete = st.columns([3, 1, 1])
                     
                     with col_select:
-                        # Get current speaker display name for default
                         current_speaker_display = speaker_id_to_display.get(current_speaker, "-- Nicht zugeordnet --") if current_speaker else "-- Nicht zugeordnet --"
                         
-                        # Use selectbox with search capability
                         selected_speaker_display = st.selectbox(
                             f"Sprecher für {label}",
                             options=speaker_names,
@@ -866,60 +785,37 @@ else:
                             label_visibility="collapsed"
                         )
                         
-                        # Get the speaker ID from the selected display name
                         new_speaker_id = speaker_display_to_id.get(selected_speaker_display) if selected_speaker_display != "-- Nicht zugeordnet --" else None
                     
                     with col_button:
                         if new_speaker_id and new_speaker_id != current_speaker:
                             if st.button(f"✓ Zuordnen", key=f"assign_{label}"):
-                                with st.spinner(f"Verarbeite {label}... (Embedding-Extraktion kann dauern)"):
-                                    # Use enhanced matching
+                                with st.spinner(f"Verarbeite {label}..."):
                                     result = assign_speaker_with_matching(
                                         call_id, label, new_speaker_id, selected_speaker_display, SIMILARITY_THRESHOLD
                                     )
                                     
                                     if result['success']:
-                                        # Show detailed results
-                                        msg = f"✅ Zugeordnet!"
-                                        if result['embedding_extracted']:
-                                            msg += f"\n🎯 Embedding extrahiert"
-                                        if result.get('skipped_short', 0) > 0 and not result['embedding_extracted']:
-                                            msg += f"\n⏭️ Kein Embedding (alle Segmente < 5s)"
-                                        elif result.get('skipped_short', 0) > 0:
-                                            msg += f"\n⏭️ {result['skipped_short']} kurze Segmente übersprungen"
-                                        if result['voiceprint_saved']:
-                                            msg += f"\n💾 Voiceprint gespeichert"
-                                        if result['segments_tested'] > 0:
-                                            msg += f"\n🔍 {result['segments_tested']} weitere Segmente getestet"
-                                        if result['auto_classified'] > 0:
-                                            msg += f"\n✨ {result['auto_classified']} Segmente zugeordnet"
-                                        if result['kept_for_review'] > 0:
-                                            msg += f"\n⚠️ {result['kept_for_review']} zur Überprüfung"
-                                        # Show background matching results
+                                        msg = f"✅ Zugeordnet! {result['auto_classified']} Segmente"
                                         if result.get('background_matches', 0) > 0:
-                                            msg += f"\n🔄 {result['background_matches']} Beiträge in {result.get('background_calls', 0)} anderen Call(s) automatisch zugeordnet!"
-                                        if result['errors']:
-                                            msg += f"\n⚠️ Hinweise: {', '.join(result['errors'][:2])}"
-                                        
+                                            msg += f"\n🔄 {result['background_matches']} in anderen Calls!"
                                         st.success(msg)
                                         update_call_status(call_id)
                                         st.experimental_rerun()
                                     else:
-                                        errors = ", ".join(result['errors']) if result['errors'] else "Unbekannter Fehler"
-                                        st.error(f"Zuordnung fehlgeschlagen: {errors}")
+                                        st.error(f"Fehler: {', '.join(result['errors'])}")
                         elif not new_speaker_id:
                             st.button("✓ Zuordnen", key=f"assign_{label}", disabled=True)
                     
                     with col_delete:
-                        if st.button("🗑️", key=f"delete_{label}", help=f"Lösche alle Beiträge von {label}"):
+                        if st.button("🗑️", key=f"delete_{label}", help=f"Lösche {label}"):
                             st.session_state[f'confirm_delete_{label}'] = True
                 
-                # Confirmation dialog outside of columns
                 if st.session_state.get(f'confirm_delete_{label}', False):
-                    st.warning(f"Wirklich {count} Beiträge von {label} löschen?")
-                    confirm_col1, confirm_col2, confirm_col3 = st.columns([1, 1, 4])
-                    with confirm_col1:
-                        if st.button("✓ Ja", key=f"confirm_yes_{label}"):
+                    st.warning(f"Wirklich {count} Beiträge löschen?")
+                    c1, c2, c3 = st.columns([1, 1, 4])
+                    with c1:
+                        if st.button("✓ Ja", key=f"yes_{label}"):
                             success, message = delete_contributions(call_id, label)
                             if success:
                                 st.success(message)
@@ -927,9 +823,9 @@ else:
                                 update_call_status(call_id)
                                 st.experimental_rerun()
                             else:
-                                st.error(f"Fehler: {message}")
-                    with confirm_col2:
-                        if st.button("✗ Nein", key=f"confirm_no_{label}"):
+                                st.error(message)
+                    with c2:
+                        if st.button("✗ Nein", key=f"no_{label}"):
                             del st.session_state[f'confirm_delete_{label}']
                             st.experimental_rerun()
                 
@@ -940,8 +836,10 @@ else:
         st.progress(progress, text=f"Fortschritt: {assignments_made}/{total_groups} Sprecher zugeordnet")
         
         if assignments_made == total_groups:
-            st.success("✅ Alle Sprecher zugeordnet! Call ist bereit für den Export.")
+            st.success("✅ Alle Sprecher zugeordnet!")
             if st.button("🔄 Seite aktualisieren"):
+                get_calls_cached.clear()
+                get_diarization_groups_cached.clear()
                 st.experimental_rerun()
 
 # Footer
