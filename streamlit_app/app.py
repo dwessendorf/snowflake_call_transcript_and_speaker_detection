@@ -18,6 +18,12 @@ st.set_page_config(page_title="Speaker Classification", page_icon="🎤", layout
 # Get Snowpark session (works in Streamlit-in-Snowflake)
 session = get_active_session()
 
+# Use dedicated warehouse for app queries (separate from background tasks)
+try:
+    session.sql("USE WAREHOUSE STREAMLIT_APP_WH").collect()
+except:
+    pass  # Fall back to default warehouse
+
 # Configuration
 SIMILARITY_THRESHOLD = 0.75  # Threshold for auto-matching
 
