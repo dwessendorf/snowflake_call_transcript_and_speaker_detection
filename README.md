@@ -1,6 +1,6 @@
-# Snowflake Speaker Detection
+# Snowflake Call Transcript and Speaker Detection
 
-A complete solution for meeting transcription with automatic speaker diarization and identification, built on Snowflake.
+A complete solution for call/meeting transcription with automatic speaker diarization and identification, built on Snowflake.
 
 ## Features
 
@@ -60,7 +60,7 @@ A complete solution for meeting transcription with automatic speaker diarization
 
 ```bash
 git clone <repository-url>
-cd snowflake_speaker_detection
+cd snowflake_call_transcript_and_speaker_detection
 ```
 
 ### Step 2: Configure Snowflake Connection
@@ -176,7 +176,7 @@ Open the Streamlit app in Snowsight:
 ## Directory Structure
 
 ```
-snowflake_speaker_detection/
+snowflake_call_transcript_and_speaker_detection/
 ├── README.md                 # This file
 ├── streamlit_app/
 │   ├── app.py               # Main Streamlit application
