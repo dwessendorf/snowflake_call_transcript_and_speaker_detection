@@ -150,9 +150,9 @@ def get_snowflake_connection():
             account=os.environ.get('SNOWFLAKE_ACCOUNT'),
             user=os.environ.get('SNOWFLAKE_USER'),
             password=os.environ.get('SNOWFLAKE_PASSWORD'),
-            database=os.environ.get('SNOWFLAKE_DATABASE', 'MEETING_AGENT_DB'),
-            schema=os.environ.get('SNOWFLAKE_SCHEMA', 'MEETING_AGENT'),
-            warehouse=os.environ.get('SNOWFLAKE_WAREHOUSE', 'CAPSTONE_LOADING_WH')
+            database=os.environ.get('SNOWFLAKE_DATABASE', 'CALL_TRANSCRIPTS_DB'),
+            schema=os.environ.get('SNOWFLAKE_SCHEMA', 'TRANSCRIPTS'),
+            warehouse=os.environ.get('SNOWFLAKE_WAREHOUSE', 'CALL_TRANSCRIPTS_WH')
         )
 
 
@@ -165,9 +165,9 @@ def download_from_stage(stage_path: str, local_path: str) -> bool:
             account=os.environ.get('SNOWFLAKE_ACCOUNT'),
             user=os.environ.get('SNOWFLAKE_USER'),
             password=os.environ.get('SNOWFLAKE_PASSWORD'),
-            database=os.environ.get('SNOWFLAKE_DATABASE', 'MEETING_AGENT_DB'),
-            schema=os.environ.get('SNOWFLAKE_SCHEMA', 'MEETING_AGENT'),
-            warehouse=os.environ.get('SNOWFLAKE_WAREHOUSE', 'CAPSTONE_LOADING_WH')
+            database=os.environ.get('SNOWFLAKE_DATABASE', 'CALL_TRANSCRIPTS_DB'),
+            schema=os.environ.get('SNOWFLAKE_SCHEMA', 'TRANSCRIPTS'),
+            warehouse=os.environ.get('SNOWFLAKE_WAREHOUSE', 'CALL_TRANSCRIPTS_WH')
         )
         cursor = conn.cursor()
         cursor.execute(f"GET {stage_path} file://{local_path}")
@@ -301,7 +301,7 @@ def extract_embedding_endpoint():
         elif audio_url:
             # Stage path (only works outside SPCS)
             with tempfile.TemporaryDirectory() as tmpdir:
-                if audio_url.startswith('@') or audio_url.startswith('MEETING_'):
+                if audio_url.startswith('@') or audio_url.startswith('CALL_'):
                     if not download_from_stage(audio_url, tmpdir):
                         return jsonify({"status": "error", "message": "Failed to download from stage"}), 500
                     files = os.listdir(tmpdir)
@@ -540,7 +540,7 @@ def match_embedding():
 
 @app.route('/identify', methods=['POST'])
 def identify_speakers():
-    """Identify speakers in a meeting by extracting embeddings and matching profiles"""
+    """Identify speakers in a call by extracting embeddings and matching profiles"""
     try:
         data = request.get_json()
         rows = data.get('data', [])
@@ -548,11 +548,11 @@ def identify_speakers():
         results = []
         for row in rows:
             row_idx = row[0]
-            meeting_id = row[1] if len(row) > 1 else None
+            call_id = row[1] if len(row) > 1 else None
             audio_path = row[2] if len(row) > 2 else None
             threshold = float(row[3]) if len(row) > 3 else 0.75
             
-            if not meeting_id or not audio_path:
+            if not call_id or not audio_path:
                 results.append([row_idx, json.dumps({"status": "error", "message": "Missing parameters"})])
                 continue
             
@@ -575,13 +575,13 @@ def identify_speakers():
                     
                     local_file = os.path.join(tmpdir, files[0])
                     
-                    # Get contributions for this meeting
+                    # Get contributions for this call
                     conn = get_snowflake_connection()
                     cursor = conn.cursor()
                     cursor.execute(f"""
                         SELECT contribution_id, diarization_label, start_time_seconds, end_time_seconds
-                        FROM MEETING_CONTRIBUTIONS
-                        WHERE meeting_id = '{meeting_id}'
+                        FROM CALL_CONTRIBUTIONS
+                        WHERE call_id = '{call_id}'
                         AND classification_status = 'pending'
                         ORDER BY segment_number
                     """)
@@ -621,7 +621,7 @@ def identify_speakers():
                             unidentified += 1
                             # Still mark for manual review
                             cursor.execute(f"""
-                                UPDATE MEETING_CONTRIBUTIONS 
+                                UPDATE CALL_CONTRIBUTIONS 
                                 SET classification_status = 'needs_review'
                                 WHERE contribution_id = '{contrib_id}'
                             """)
@@ -640,7 +640,7 @@ def identify_speakers():
                         if best_match:
                             # Auto-identify
                             cursor.execute(f"""
-                                UPDATE MEETING_CONTRIBUTIONS 
+                                UPDATE CALL_CONTRIBUTIONS 
                                 SET identified_speaker_id = '{best_match["speaker_id"]}',
                                     identification_method = 'voice_embedding',
                                     identification_confidence = {best_score},
@@ -651,7 +651,7 @@ def identify_speakers():
                         else:
                             # Mark for manual review
                             cursor.execute(f"""
-                                UPDATE MEETING_CONTRIBUTIONS 
+                                UPDATE CALL_CONTRIBUTIONS 
                                 SET classification_status = 'needs_review',
                                     embedding = '{json.dumps(emb.tolist())}'
                                 WHERE contribution_id = '{contrib_id}'
@@ -664,14 +664,14 @@ def identify_speakers():
                     
                     results.append([row_idx, json.dumps({
                         "status": "success",
-                        "meeting_id": meeting_id,
+                        "call_id": call_id,
                         "identified": identified,
                         "needs_review": unidentified,
                         "total_profiles": len(profiles)
                     })])
                     
             except Exception as e:
-                logger.error(f"Error processing meeting {meeting_id}: {e}")
+                logger.error(f"Error processing call {call_id}: {e}")
                 results.append([row_idx, json.dumps({"status": "error", "message": str(e)})])
         
         return jsonify({"data": results})

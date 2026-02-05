@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Meeting Upload CLI
-Upload meeting recordings, monitor transcription, and export transcripts.
+Call Upload CLI
+Upload call recordings, monitor transcription, and export transcripts.
 """
 
 import sys
@@ -25,15 +25,15 @@ console = Console()
 
 
 @click.group()
-@click.version_option(version="1.0.0", prog_name="meeting-cli")
+@click.version_option(version="1.0.0", prog_name="call-cli")
 def cli():
-    """Meeting Upload CLI - Process meeting recordings with Snowflake"""
+    """Call Upload CLI - Process call recordings with Snowflake"""
     pass
 
 
 @cli.command()
 @click.argument("audio_file", type=click.Path(exists=True))
-@click.option("--title", "-t", help="Meeting title (default: filename)")
+@click.option("--title", "-t", help="Call title (default: filename)")
 @click.option("--no-identify", is_flag=True, help="Skip speaker identification")
 @click.option("--watch", "-w", is_flag=True, help="Watch until complete and auto-export")
 def upload(audio_file: str, title: Optional[str], no_identify: bool, watch: bool):
@@ -45,11 +45,11 @@ def upload(audio_file: str, title: Optional[str], no_identify: bool, watch: bool
     
     Examples:
     
-        meeting-cli upload "Weekly Sync.m4a"
+        call-cli upload "Weekly Sync.m4a"
         
-        meeting-cli upload meeting.mp3 --title "Q4 Planning"
+        call-cli upload call.mp3 --title "Q4 Planning"
         
-        meeting-cli upload call.m4a --watch
+        call-cli upload call.m4a --watch
     """
     audio_path = Path(audio_file)
     
@@ -58,7 +58,7 @@ def upload(audio_file: str, title: Optional[str], no_identify: bool, watch: bool
         title = audio_path.stem
     
     console.print()
-    console.print(Panel(f"[bold blue]Uploading:[/] {audio_path.name}", title="Meeting Upload CLI"))
+    console.print(Panel(f"[bold blue]Uploading:[/] {audio_path.name}", title="Call Upload CLI"))
     console.print()
     
     # Step 1: Check and convert audio
@@ -132,9 +132,9 @@ def upload(audio_file: str, title: Optional[str], no_identify: bool, watch: bool
             transient=True
         ) as progress:
             progress.add_task("Processing...", total=None)
-            meeting_id = snowflake_client.start_transcription(stage_path, title)
+            call_id = snowflake_client.start_transcription(stage_path, title)
         
-        console.print(f"      [green]✓[/] Meeting created: {meeting_id}")
+        console.print(f"      [green]✓[/] Call created: {call_id}")
     
     except snowflake_client.SnowflakeClientError as e:
         console.print(f"[red]Error:[/] {e}")
@@ -154,7 +154,7 @@ def upload(audio_file: str, title: Optional[str], no_identify: bool, watch: bool
                 transient=True
             ) as progress:
                 progress.add_task("Identifying speakers...", total=None)
-                result = snowflake_client.start_speaker_identification(meeting_id)
+                result = snowflake_client.start_speaker_identification(call_id)
             
             console.print(f"      [green]✓[/] Speaker identification started")
         
@@ -167,59 +167,59 @@ def upload(audio_file: str, title: Optional[str], no_identify: bool, watch: bool
     
     # Summary
     console.print(Panel.fit(
-        f"[bold green]Meeting ID:[/] {meeting_id}\n"
+        f"[bold green]Call ID:[/] {call_id}\n"
         f"[bold]Status:[/] in_progress\n\n"
-        f"Run [cyan]meeting-cli watch {meeting_id}[/] to monitor and auto-export",
+        f"Run [cyan]call-cli watch {call_id}[/] to monitor and auto-export",
         title="Upload Complete"
     ))
     
     # Watch mode
     if watch:
         console.print()
-        _do_watch(meeting_id)
+        _do_watch(call_id)
 
 
 @cli.command()
-@click.argument("meeting_id", required=False)
-@click.option("--all", "-a", "show_all", is_flag=True, help="Show all meetings")
-@click.option("--limit", "-n", default=10, help="Number of meetings to show")
-def status(meeting_id: Optional[str], show_all: bool, limit: int):
-    """Check the status of meetings.
+@click.argument("call_id", required=False)
+@click.option("--all", "-a", "show_all", is_flag=True, help="Show all calls")
+@click.option("--limit", "-n", default=10, help="Number of calls to show")
+def status(call_id: Optional[str], show_all: bool, limit: int):
+    """Check the status of calls.
     
     Examples:
     
-        meeting-cli status                    # Show recent meetings
+        call-cli status                    # Show recent calls
         
-        meeting-cli status MTG_123            # Show specific meeting
+        call-cli status CALL_123           # Show specific call
         
-        meeting-cli status --all --limit 20   # Show more meetings
+        call-cli status --all --limit 20   # Show more calls
     """
     console.print()
     
-    if meeting_id:
-        # Show specific meeting status
+    if call_id:
+        # Show specific call status
         try:
-            status_info = snowflake_client.get_meeting_status(meeting_id)
+            status_info = snowflake_client.get_call_status(call_id)
             
             if status_info.get("status") == "not_found":
-                console.print(f"[red]Error:[/] Meeting not found: {meeting_id}")
+                console.print(f"[red]Error:[/] Call not found: {call_id}")
                 sys.exit(1)
             
-            _print_meeting_detail(status_info)
+            _print_call_detail(status_info)
         
         except snowflake_client.SnowflakeClientError as e:
             console.print(f"[red]Error:[/] {e}")
             sys.exit(1)
     else:
-        # List recent meetings
+        # List recent calls
         try:
-            meetings = snowflake_client.list_meetings(limit=limit)
+            calls = snowflake_client.list_calls(limit=limit)
             
-            if not meetings:
-                console.print("[yellow]No meetings found.[/]")
+            if not calls:
+                console.print("[yellow]No calls found.[/]")
                 return
             
-            _print_meetings_table(meetings)
+            _print_calls_table(calls)
         
         except snowflake_client.SnowflakeClientError as e:
             console.print(f"[red]Error:[/] {e}")
@@ -227,30 +227,30 @@ def status(meeting_id: Optional[str], show_all: bool, limit: int):
 
 
 @cli.command()
-@click.argument("meeting_id")
+@click.argument("call_id")
 @click.option("--output", "-o", type=click.Path(), help="Output directory")
 @click.option("--no-timestamps", is_flag=True, help="Exclude timestamps from transcript")
-def export(meeting_id: str, output: Optional[str], no_timestamps: bool):
-    """Export a meeting transcript to Markdown.
+def export(call_id: str, output: Optional[str], no_timestamps: bool):
+    """Export a call transcript to Markdown.
     
-    The transcript will be saved to ~/Documents/MeetingTranscripts/ by default.
+    The transcript will be saved to ~/Documents/CallTranscripts/ by default.
     
     Examples:
     
-        meeting-cli export MTG_123
+        call-cli export CALL_123
         
-        meeting-cli export MTG_123 --output ~/Desktop
+        call-cli export CALL_123 --output ~/Desktop
         
-        meeting-cli export MTG_123 --no-timestamps
+        call-cli export CALL_123 --no-timestamps
     """
     console.print()
     
-    # Check if meeting is complete
+    # Check if call is complete
     try:
-        status_info = snowflake_client.get_meeting_status(meeting_id)
+        status_info = snowflake_client.get_call_status(call_id)
         
         if status_info.get("status") == "not_found":
-            console.print(f"[red]Error:[/] Meeting not found: {meeting_id}")
+            console.print(f"[red]Error:[/] Call not found: {call_id}")
             sys.exit(1)
         
         total = status_info.get("total_contributions", 0)
@@ -278,8 +278,8 @@ def export(meeting_id: str, output: Optional[str], no_timestamps: bool):
             transient=True
         ) as progress:
             progress.add_task("Generating...", total=None)
-            output_path = transcript.export_meeting(
-                meeting_id,
+            output_path = transcript.export_call(
+                call_id,
                 output_dir=output_dir,
                 include_timestamps=not no_timestamps
             )
@@ -296,40 +296,40 @@ def export(meeting_id: str, output: Optional[str], no_timestamps: bool):
 
 
 @cli.command()
-@click.argument("meeting_id")
+@click.argument("call_id")
 @click.option("--interval", "-i", default=10, help="Poll interval in seconds")
 @click.option("--output", "-o", type=click.Path(), help="Output directory for transcript")
-def watch(meeting_id: str, interval: int, output: Optional[str]):
-    """Monitor a meeting until complete, then export transcript.
+def watch(call_id: str, interval: int, output: Optional[str]):
+    """Monitor a call until complete, then export transcript.
     
-    This command polls the meeting status and automatically exports
+    This command polls the call status and automatically exports
     the transcript when all speakers have been identified.
     
     Examples:
     
-        meeting-cli watch MTG_123
+        call-cli watch CALL_123
         
-        meeting-cli watch MTG_123 --interval 30
+        call-cli watch CALL_123 --interval 30
         
-        meeting-cli watch MTG_123 --output ~/Desktop
+        call-cli watch CALL_123 --output ~/Desktop
     """
     console.print()
-    _do_watch(meeting_id, interval=interval, output_dir=output)
+    _do_watch(call_id, interval=interval, output_dir=output)
 
 
-def _do_watch(meeting_id: str, interval: int = 10, output_dir: Optional[str] = None):
+def _do_watch(call_id: str, interval: int = 10, output_dir: Optional[str] = None):
     """Internal watch implementation"""
-    console.print(f"[bold cyan]Watching meeting:[/] {meeting_id}")
+    console.print(f"[bold cyan]Watching call:[/] {call_id}")
     console.print(f"Polling every {interval} seconds. Press Ctrl+C to stop.")
     console.print()
     
     try:
         attempts = 0
         while attempts < config.MAX_POLL_ATTEMPTS:
-            status_info = snowflake_client.get_meeting_status(meeting_id)
+            status_info = snowflake_client.get_call_status(call_id)
             
             if status_info.get("status") == "not_found":
-                console.print(f"[red]Error:[/] Meeting not found: {meeting_id}")
+                console.print(f"[red]Error:[/] Call not found: {call_id}")
                 return
             
             total = status_info.get("total_contributions", 0)
@@ -368,8 +368,8 @@ def _do_watch(meeting_id: str, interval: int = 10, output_dir: Optional[str] = N
                 # Export transcript
                 console.print("[bold cyan]Exporting transcript...[/]")
                 
-                output_path = transcript.export_meeting(
-                    meeting_id,
+                output_path = transcript.export_call(
+                    call_id,
                     output_dir=Path(output_dir) if output_dir else None
                 )
                 
@@ -384,14 +384,14 @@ def _do_watch(meeting_id: str, interval: int = 10, output_dir: Optional[str] = N
             attempts += 1
         
         console.print()
-        console.print("[yellow]Timeout reached. Meeting still in progress.[/]")
-        console.print(f"Run [cyan]meeting-cli watch {meeting_id}[/] to continue monitoring.")
+        console.print("[yellow]Timeout reached. Call still in progress.[/]")
+        console.print(f"Run [cyan]call-cli watch {call_id}[/] to continue monitoring.")
     
     except KeyboardInterrupt:
         console.print()
         console.print()
         console.print("[yellow]Stopped watching.[/]")
-        console.print(f"Run [cyan]meeting-cli watch {meeting_id}[/] to resume.")
+        console.print(f"Run [cyan]call-cli watch {call_id}[/] to resume.")
     
     except snowflake_client.SnowflakeClientError as e:
         console.print()
@@ -405,8 +405,8 @@ def _progress_bar(pct: float, width: int = 20) -> str:
     return f"[{'█' * filled}{'░' * empty}]"
 
 
-def _print_meeting_detail(status_info: dict):
-    """Print detailed meeting status"""
+def _print_call_detail(status_info: dict):
+    """Print detailed call status"""
     status = status_info.get("status", "unknown")
     status_color = {
         "completed": "green",
@@ -420,32 +420,32 @@ def _print_meeting_detail(status_info: dict):
     
     console.print(Panel(
         f"[bold]Title:[/] {status_info.get('title', 'Unknown')}\n"
-        f"[bold]Meeting ID:[/] {status_info.get('meeting_id')}\n"
-        f"[bold]Date:[/] {status_info.get('meeting_date', 'Unknown')}\n"
+        f"[bold]Call ID:[/] {status_info.get('call_id')}\n"
+        f"[bold]Date:[/] {status_info.get('call_date', 'Unknown')}\n"
         f"[bold]Status:[/] [{status_color}]{status}[/]\n"
         f"[bold]Transcription:[/] {status_info.get('transcription_status', 'Unknown')}\n"
         f"[bold]Classification:[/] {status_info.get('classification_status', 'Unknown')}\n"
         f"[bold]Progress:[/] {identified}/{total} speakers identified",
-        title="Meeting Status"
+        title="Call Status"
     ))
     
     if status == "completed":
         console.print()
-        console.print(f"Run [cyan]meeting-cli export {status_info.get('meeting_id')}[/] to get transcript")
+        console.print(f"Run [cyan]call-cli export {status_info.get('call_id')}[/] to get transcript")
 
 
-def _print_meetings_table(meetings: list):
-    """Print meetings in a table format"""
-    table = Table(title="Recent Meetings")
+def _print_calls_table(calls: list):
+    """Print calls in a table format"""
+    table = Table(title="Recent Calls")
     
-    table.add_column("Meeting ID", style="cyan", no_wrap=True)
+    table.add_column("Call ID", style="cyan", no_wrap=True)
     table.add_column("Title", max_width=30)
     table.add_column("Date")
     table.add_column("Status")
     table.add_column("Progress", justify="right")
     
-    for m in meetings:
-        status = m.get("status", "unknown")
+    for c in calls:
+        status = c.get("status", "unknown")
         status_color = {
             "completed": "green",
             "in_progress": "yellow",
@@ -454,11 +454,11 @@ def _print_meetings_table(meetings: list):
         }.get(status, "white")
         
         table.add_row(
-            m.get("meeting_id", ""),
-            m.get("title", "")[:30],
-            str(m.get("meeting_date", ""))[:10],
+            c.get("call_id", ""),
+            c.get("title", "")[:30],
+            str(c.get("call_date", ""))[:10],
             f"[{status_color}]{status}[/]",
-            m.get("progress", "0%")
+            c.get("progress", "0%")
         )
     
     console.print(table)

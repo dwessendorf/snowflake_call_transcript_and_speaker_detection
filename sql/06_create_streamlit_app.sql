@@ -1,10 +1,10 @@
 -- ============================================================================
--- Snowflake Speaker Detection - Streamlit App Deployment
+-- Snowflake Call Transcript and Speaker Detection - Streamlit App Deployment
 -- ============================================================================
 -- Deploys the Speaker Classification Streamlit application
 -- ============================================================================
 
-USE SCHEMA MEETING_AGENT_DB.MEETING_AGENT;
+USE SCHEMA CALL_TRANSCRIPTS_DB.TRANSCRIPTS;
 
 -- ============================================================================
 -- Step 1: Upload app.py to stage
@@ -19,11 +19,11 @@ USE SCHEMA MEETING_AGENT_DB.MEETING_AGENT;
 -- Step 2: Create Streamlit App
 -- ============================================================================
 CREATE STREAMLIT IF NOT EXISTS SPEAKER_CLASSIFICATION_APP
-    ROOT_LOCATION = '@MEETING_AGENT_DB.MEETING_AGENT.STREAMLIT_APPS/speaker_classification_app'
+    ROOT_LOCATION = '@CALL_TRANSCRIPTS_DB.TRANSCRIPTS.STREAMLIT_APPS/speaker_classification_app'
     MAIN_FILE = 'app.py'
-    QUERY_WAREHOUSE = MEETING_AGENT_WH  -- Update to your warehouse name
+    QUERY_WAREHOUSE = CALL_TRANSCRIPTS_WH  -- Update to your warehouse name
     TITLE = 'Speaker Classification'
-    COMMENT = 'UI for classifying and managing speakers in meeting transcripts';
+    COMMENT = 'UI for classifying and managing speakers in call transcripts';
 
 -- ============================================================================
 -- Step 3: Grant access (optional - for other roles)
@@ -33,7 +33,7 @@ CREATE STREAMLIT IF NOT EXISTS SPEAKER_CLASSIFICATION_APP
 -- ============================================================================
 -- Verify deployment
 -- ============================================================================
-SHOW STREAMLITS IN SCHEMA MEETING_AGENT_DB.MEETING_AGENT;
+SHOW STREAMLITS IN SCHEMA CALL_TRANSCRIPTS_DB.TRANSCRIPTS;
 
 -- ============================================================================
 -- To update the app after changes:

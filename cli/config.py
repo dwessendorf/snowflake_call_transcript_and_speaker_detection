@@ -1,5 +1,5 @@
 """
-Configuration for Meeting Upload CLI
+Configuration for Call Upload CLI
 
 Update these settings to match your Snowflake environment.
 You can also use environment variables to override these values.
@@ -28,20 +28,20 @@ SNOWFLAKE_PRIVATE_KEY_PATH = os.environ.get(
 # ============================================================================
 # Database Settings
 # ============================================================================
-SNOWFLAKE_DATABASE = os.environ.get("SNOWFLAKE_DATABASE", "MEETING_AGENT_DB")
-SNOWFLAKE_SCHEMA = os.environ.get("SNOWFLAKE_SCHEMA", "MEETING_AGENT")
-SNOWFLAKE_WAREHOUSE = os.environ.get("SNOWFLAKE_WAREHOUSE", "MEETING_AGENT_WH")
+SNOWFLAKE_DATABASE = os.environ.get("SNOWFLAKE_DATABASE", "CALL_TRANSCRIPTS_DB")
+SNOWFLAKE_SCHEMA = os.environ.get("SNOWFLAKE_SCHEMA", "TRANSCRIPTS")
+SNOWFLAKE_WAREHOUSE = os.environ.get("SNOWFLAKE_WAREHOUSE", "CALL_TRANSCRIPTS_WH")
 
 # ============================================================================
 # Stages (auto-derived from database/schema)
 # ============================================================================
-STAGE_RECORDINGS = f"@{SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.MEETING_RECORDINGS"
-STAGE_TRANSCRIPTIONS = f"@{SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.MEETING_TRANSCRIPTIONS"
+STAGE_RECORDINGS = f"@{SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.CALL_RECORDINGS"
+STAGE_TRANSCRIPTIONS = f"@{SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.CALL_TRANSCRIPTIONS"
 
 # ============================================================================
 # Output Directory
 # ============================================================================
-DEFAULT_OUTPUT_DIR = Path.home() / "Documents" / "MeetingTranscripts"
+DEFAULT_OUTPUT_DIR = Path.home() / "Documents" / "CallTranscripts"
 
 # ============================================================================
 # Audio Format Settings
@@ -81,4 +81,4 @@ MAX_POLL_ATTEMPTS = 360
 # ============================================================================
 # Identifiers
 # ============================================================================
-MEETING_ID_PREFIX = "MTG"
+CALL_ID_PREFIX = "CALL"

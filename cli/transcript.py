@@ -1,6 +1,6 @@
 """
-Transcript generation for Meeting Upload CLI
-Generates formatted Markdown transcripts from meeting data
+Transcript generation for Call Upload CLI
+Generates formatted Markdown transcripts from call data
 """
 
 from datetime import datetime
@@ -60,7 +60,7 @@ def format_duration(minutes: Optional[float]) -> str:
 
 
 def generate_markdown(
-    meeting_info: Dict[str, Any],
+    call_info: Dict[str, Any],
     contributions: List[Dict[str, Any]],
     include_timestamps: bool = True,
     include_summary: bool = True
@@ -69,7 +69,7 @@ def generate_markdown(
     Generate a formatted Markdown transcript
     
     Args:
-        meeting_info: Meeting metadata dict
+        call_info: Call metadata dict
         contributions: List of contribution dicts with speaker info
         include_timestamps: Whether to include timestamps
         include_summary: Whether to include AI summary if available
@@ -80,27 +80,27 @@ def generate_markdown(
     lines = []
     
     # Title
-    title = meeting_info.get("title", "Meeting Transcript")
-    meeting_date = format_date(meeting_info.get("meeting_date"))
+    title = call_info.get("title", "Call Transcript")
+    call_date = format_date(call_info.get("call_date"))
     
     lines.append(f"# {title}")
     lines.append("")
     
     # Metadata
-    lines.append(f"**Date:** {meeting_date}")
+    lines.append(f"**Date:** {call_date}")
     
-    duration = meeting_info.get("duration_minutes")
+    duration = call_info.get("duration_minutes")
     if duration:
         lines.append(f"**Duration:** {format_duration(duration)}")
     
-    speakers = meeting_info.get("speakers", [])
+    speakers = call_info.get("speakers", [])
     if speakers:
         # Filter out generic speaker labels
         named_speakers = [s for s in speakers if s and not s.startswith("SPEAKER_")]
         if named_speakers:
             lines.append(f"**Speakers:** {', '.join(sorted(named_speakers))}")
     
-    language = meeting_info.get("language")
+    language = call_info.get("language")
     if language:
         lines.append(f"**Language:** {language}")
     
@@ -109,7 +109,7 @@ def generate_markdown(
     lines.append("")
     
     # Summary (if available)
-    summary = meeting_info.get("summary")
+    summary = call_info.get("summary")
     if include_summary and summary:
         lines.append("## Summary")
         lines.append("")
@@ -155,15 +155,15 @@ def generate_markdown(
     lines.append("---")
     lines.append("")
     lines.append(f"*Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}*")
-    lines.append(f"*Meeting ID: {meeting_info.get('meeting_id', 'Unknown')}*")
+    lines.append(f"*Call ID: {call_info.get('call_id', 'Unknown')}*")
     
     return "\n".join(lines)
 
 
-def generate_filename(meeting_info: Dict[str, Any]) -> str:
+def generate_filename(call_info: Dict[str, Any]) -> str:
     """Generate a filename for the transcript"""
-    title = meeting_info.get("title", "meeting")
-    date = meeting_info.get("meeting_date")
+    title = call_info.get("title", "call")
+    date = call_info.get("call_date")
     
     # Clean title for filename
     import re
@@ -184,7 +184,7 @@ def generate_filename(meeting_info: Dict[str, Any]) -> str:
 
 
 def save_transcript(
-    meeting_info: Dict[str, Any],
+    call_info: Dict[str, Any],
     contributions: List[Dict[str, Any]],
     output_dir: Optional[Path] = None,
     filename: Optional[str] = None,
@@ -194,7 +194,7 @@ def save_transcript(
     Generate and save a Markdown transcript
     
     Args:
-        meeting_info: Meeting metadata dict
+        call_info: Call metadata dict
         contributions: List of contribution dicts
         output_dir: Output directory (default: config.DEFAULT_OUTPUT_DIR)
         filename: Output filename (default: auto-generated)
@@ -212,13 +212,13 @@ def save_transcript(
     
     # Generate filename
     if filename is None:
-        filename = generate_filename(meeting_info)
+        filename = generate_filename(call_info)
     
     output_path = output_dir / filename
     
     # Generate markdown
     markdown = generate_markdown(
-        meeting_info,
+        call_info,
         contributions,
         include_timestamps=include_timestamps
     )
@@ -229,16 +229,16 @@ def save_transcript(
     return output_path
 
 
-def export_meeting(
-    meeting_id: str,
+def export_call(
+    call_id: str,
     output_dir: Optional[Path] = None,
     include_timestamps: bool = True
 ) -> Path:
     """
-    Export a meeting transcript to Markdown
+    Export a call transcript to Markdown
     
     Args:
-        meeting_id: Meeting ID to export
+        call_id: Call ID to export
         output_dir: Output directory
         include_timestamps: Whether to include timestamps
         
@@ -248,11 +248,11 @@ def export_meeting(
     from . import snowflake_client
     
     # Get transcript data
-    meeting_info, contributions = snowflake_client.get_transcript(meeting_id)
+    call_info, contributions = snowflake_client.get_transcript(call_id)
     
     # Save transcript
     return save_transcript(
-        meeting_info,
+        call_info,
         contributions,
         output_dir=output_dir,
         include_timestamps=include_timestamps

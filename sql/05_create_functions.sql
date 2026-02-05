@@ -1,11 +1,11 @@
 -- ============================================================================
--- Snowflake Speaker Detection - Functions and Procedures
+-- Snowflake Call Transcript and Speaker Detection - Functions and Procedures
 -- ============================================================================
 -- Creates service functions and stored procedures
 -- Run AFTER the SPCS service is deployed and running
 -- ============================================================================
 
-USE SCHEMA MEETING_AGENT_DB.MEETING_AGENT;
+USE SCHEMA CALL_TRANSCRIPTS_DB.TRANSCRIPTS;
 
 -- ============================================================================
 -- Service Function: Extract speaker embedding from audio URL
@@ -31,11 +31,11 @@ AS '/extract-embedding-url';
 -- ============================================================================
 -- This procedure wraps the embedding extraction with business logic
 -- Parameters:
---   P_MEETING_ID: Meeting ID
+--   P_CALL_ID: Call ID
 --   P_CONTRIBUTION_ID: Contribution ID to extract embedding for
 
 CREATE OR REPLACE PROCEDURE EXTRACT_CONTRIBUTION_EMBEDDING(
-    P_MEETING_ID VARCHAR,
+    P_CALL_ID VARCHAR,
     P_CONTRIBUTION_ID VARCHAR
 )
 RETURNS VARIANT
@@ -47,13 +47,13 @@ EXECUTE AS OWNER
 AS '
 import json
 
-def extract_embedding(session, p_meeting_id, p_contribution_id):
+def extract_embedding(session, p_call_id, p_contribution_id):
     try:
         # Get contribution details
         contrib = session.sql(f"""
-            SELECT c.start_time_seconds, c.end_time_seconds, m.recording_path
-            FROM MEETING_CONTRIBUTIONS c
-            JOIN MEETINGS m ON c.meeting_id = m.meeting_id
+            SELECT c.start_time_seconds, c.end_time_seconds, cl.recording_path
+            FROM CALL_CONTRIBUTIONS c
+            JOIN CALLS cl ON c.call_id = cl.call_id
             WHERE c.contribution_id = ''{p_contribution_id}''
         """).collect()
         
@@ -117,16 +117,16 @@ def extract_embedding(session, p_meeting_id, p_contribution_id):
 -- Test the functions (run after service is up)
 -- ============================================================================
 -- First, get a presigned URL for testing:
--- SELECT GET_PRESIGNED_URL('@MEETING_RECORDINGS', 'your_audio_file.mp3', 3600) as test_url;
+-- SELECT GET_PRESIGNED_URL('@CALL_RECORDINGS', 'your_audio_file.mp3', 3600) as test_url;
 
 -- Then test the embedding extraction:
 -- SELECT SPEAKER_EMBEDDING_URL('<presigned_url>', 0.0, 30.0);
 
 -- Test the procedure:
--- CALL EXTRACT_CONTRIBUTION_EMBEDDING('<meeting_id>', '<contribution_id>');
+-- CALL EXTRACT_CONTRIBUTION_EMBEDDING('<call_id>', '<contribution_id>');
 
 -- ============================================================================
 -- Verify functions created
 -- ============================================================================
-SHOW FUNCTIONS LIKE '%SPEAKER%' IN SCHEMA MEETING_AGENT_DB.MEETING_AGENT;
-SHOW PROCEDURES LIKE '%EMBEDDING%' IN SCHEMA MEETING_AGENT_DB.MEETING_AGENT;
+SHOW FUNCTIONS LIKE '%SPEAKER%' IN SCHEMA CALL_TRANSCRIPTS_DB.TRANSCRIPTS;
+SHOW PROCEDURES LIKE '%EMBEDDING%' IN SCHEMA CALL_TRANSCRIPTS_DB.TRANSCRIPTS;

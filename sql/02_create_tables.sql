@@ -1,10 +1,10 @@
 -- ============================================================================
--- Snowflake Speaker Detection - Table Creation
+-- Snowflake Call Transcript and Speaker Detection - Table Creation
 -- ============================================================================
 -- Creates all required tables for the speaker detection solution
 -- ============================================================================
 
-USE SCHEMA MEETING_AGENT_DB.MEETING_AGENT;
+USE SCHEMA CALL_TRANSCRIPTS_DB.TRANSCRIPTS;
 
 -- ============================================================================
 -- SPEAKERS - Registry of known speakers
@@ -24,15 +24,15 @@ CREATE TABLE IF NOT EXISTS SPEAKERS (
 );
 
 -- ============================================================================
--- MEETINGS - Meeting metadata and status
+-- CALLS - Call metadata and status
 -- ============================================================================
-CREATE TABLE IF NOT EXISTS MEETINGS (
-    MEETING_ID VARCHAR(50) NOT NULL PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS CALLS (
+    CALL_ID VARCHAR(50) NOT NULL PRIMARY KEY,
     TITLE VARCHAR(500),
-    MEETING_DATE DATE,
-    MEETING_TIME TIME,
+    CALL_DATE DATE,
+    CALL_TIME TIME,
     DURATION_MINUTES NUMBER,
-    MEETING_TYPE VARCHAR(100),
+    CALL_TYPE VARCHAR(100),
     RECORDING_PATH VARCHAR(500),
     TRANSCRIPTION_PATH VARCHAR(500),
     TRANSCRIPTION_STATUS VARCHAR(50) DEFAULT 'pending',
@@ -68,11 +68,11 @@ CREATE TABLE IF NOT EXISTS SPEAKER_PROFILES (
 );
 
 -- ============================================================================
--- MEETING_CONTRIBUTIONS - Individual speech segments from meetings
+-- CALL_CONTRIBUTIONS - Individual speech segments from calls
 -- ============================================================================
-CREATE TABLE IF NOT EXISTS MEETING_CONTRIBUTIONS (
+CREATE TABLE IF NOT EXISTS CALL_CONTRIBUTIONS (
     CONTRIBUTION_ID VARCHAR(50) NOT NULL PRIMARY KEY,
-    MEETING_ID VARCHAR(50) NOT NULL REFERENCES MEETINGS(MEETING_ID),
+    CALL_ID VARCHAR(50) NOT NULL REFERENCES CALLS(CALL_ID),
     SEGMENT_NUMBER NUMBER NOT NULL,
     DIARIZATION_LABEL VARCHAR(20),
     IDENTIFIED_SPEAKER_ID VARCHAR(50) REFERENCES SPEAKERS(SPEAKER_ID),
@@ -99,8 +99,8 @@ CREATE TABLE IF NOT EXISTS MEETING_CONTRIBUTIONS (
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS CLASSIFICATION_QUEUE (
     QUEUE_ID VARCHAR(50) NOT NULL PRIMARY KEY,
-    MEETING_ID VARCHAR(50) NOT NULL REFERENCES MEETINGS(MEETING_ID),
-    CONTRIBUTION_ID VARCHAR(50) NOT NULL REFERENCES MEETING_CONTRIBUTIONS(CONTRIBUTION_ID),
+    CALL_ID VARCHAR(50) NOT NULL REFERENCES CALLS(CALL_ID),
+    CONTRIBUTION_ID VARCHAR(50) NOT NULL REFERENCES CALL_CONTRIBUTIONS(CONTRIBUTION_ID),
     DIARIZATION_LABEL VARCHAR(20),
     SUGGESTED_SPEAKER_ID VARCHAR(50),
     SUGGESTED_SPEAKER_NAME VARCHAR(200),
@@ -140,10 +140,10 @@ CREATE TABLE IF NOT EXISTS SPEAKER_VOICEPRINTS (
 );
 
 -- Create indexes for performance
-CREATE INDEX IF NOT EXISTS idx_contributions_meeting ON MEETING_CONTRIBUTIONS(MEETING_ID);
-CREATE INDEX IF NOT EXISTS idx_contributions_speaker ON MEETING_CONTRIBUTIONS(IDENTIFIED_SPEAKER_ID);
-CREATE INDEX IF NOT EXISTS idx_queue_meeting ON CLASSIFICATION_QUEUE(MEETING_ID);
+CREATE INDEX IF NOT EXISTS idx_contributions_call ON CALL_CONTRIBUTIONS(CALL_ID);
+CREATE INDEX IF NOT EXISTS idx_contributions_speaker ON CALL_CONTRIBUTIONS(IDENTIFIED_SPEAKER_ID);
+CREATE INDEX IF NOT EXISTS idx_queue_call ON CLASSIFICATION_QUEUE(CALL_ID);
 CREATE INDEX IF NOT EXISTS idx_queue_status ON CLASSIFICATION_QUEUE(STATUS);
 
 -- Verify tables created
-SHOW TABLES IN SCHEMA MEETING_AGENT_DB.MEETING_AGENT;
+SHOW TABLES IN SCHEMA CALL_TRANSCRIPTS_DB.TRANSCRIPTS;

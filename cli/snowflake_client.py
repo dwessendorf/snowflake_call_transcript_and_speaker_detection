@@ -1,5 +1,5 @@
 """
-Snowflake client for Meeting Upload CLI
+Snowflake client for Call Upload CLI
 Handles uploads, transcription, and status queries
 """
 
@@ -20,8 +20,8 @@ class SnowflakeClientError(Exception):
     pass
 
 
-class MeetingStatus:
-    """Meeting processing status"""
+class CallStatus:
+    """Call processing status"""
     PENDING = "pending"
     TRANSCRIBING = "transcribing"
     IN_PROGRESS = "in_progress"
@@ -81,8 +81,8 @@ def get_connection() -> snowflake.connector.SnowflakeConnection:
         raise SnowflakeClientError(f"Failed to connect to Snowflake: {e}")
 
 
-def generate_meeting_id(title: str) -> str:
-    """Generate a unique meeting ID from title"""
+def generate_call_id(title: str) -> str:
+    """Generate a unique call ID from title"""
     # Clean title for ID - keep shorter to fit contribution IDs
     clean = re.sub(r'[^a-zA-Z0-9\s]', '', title)
     clean = re.sub(r'\s+', '_', clean).upper()[:18]  # Shorter to allow contrib suffix
@@ -91,7 +91,7 @@ def generate_meeting_id(title: str) -> str:
     date_str = datetime.now().strftime("%Y%m%d")
     short_uuid = uuid.uuid4().hex[:6].upper()
     
-    return f"{config.MEETING_ID_PREFIX}_{date_str}_{clean}_{short_uuid}"
+    return f"{config.CALL_ID_PREFIX}_{date_str}_{clean}_{short_uuid}"
 
 
 def sanitize_filename(filename: str) -> str:
@@ -112,7 +112,7 @@ def upload_to_stage(
     
     Args:
         local_path: Path to local file
-        stage_name: Target stage (default: MEETING_RECORDINGS)
+        stage_name: Target stage (default: CALL_RECORDINGS)
         auto_compress: Whether to auto-compress the file
         
     Returns:
@@ -223,24 +223,24 @@ def _upload_via_snowsql(local_path: Path, stage_name: str, stage_filename: str, 
 
 def start_transcription(
     stage_path: str,
-    meeting_title: str,
-    meeting_date: Optional[datetime] = None
+    call_title: str,
+    call_date: Optional[datetime] = None
 ) -> str:
     """
     Start transcription for an uploaded audio file
     
     Args:
         stage_path: Path to file in stage
-        meeting_title: Title for the meeting
-        meeting_date: Date of meeting (default: today)
+        call_title: Title for the call
+        call_date: Date of call (default: today)
         
     Returns:
-        Meeting ID
+        Call ID
     """
-    if meeting_date is None:
-        meeting_date = datetime.now()
+    if call_date is None:
+        call_date = datetime.now()
     
-    meeting_id = generate_meeting_id(meeting_title)
+    call_id = generate_call_id(call_title)
     
     conn = get_connection()
     try:
@@ -252,7 +252,7 @@ def start_transcription(
         cursor.execute(f"USE WAREHOUSE {config.SNOWFLAKE_WAREHOUSE}")
         
         # Call transcription procedure
-        cursor.execute(f"CALL TRANSCRIBE_MEETING('{stage_path}')")
+        cursor.execute(f"CALL TRANSCRIBE_CALL('{stage_path}')")
         result = cursor.fetchone()
         
         if result:
@@ -265,16 +265,16 @@ def start_transcription(
                     num_speakers = data.get("num_speakers", 0)
                     duration_mins = data.get("estimated_duration_minutes", 0)
                     
-                    # Save to MEETINGS table
+                    # Save to CALLS table
                     insert_sql = f"""
-                    INSERT INTO MEETINGS (
-                        MEETING_ID, TITLE, MEETING_DATE, RECORDING_PATH, 
+                    INSERT INTO CALLS (
+                        CALL_ID, TITLE, CALL_DATE, RECORDING_PATH, 
                         TRANSCRIPTION_STATUS, CLASSIFICATION_STATUS,
                         TOTAL_SPEAKERS, DURATION_MINUTES, CREATED_AT
                     ) VALUES (
-                        '{meeting_id}', 
-                        '{meeting_title.replace("'", "''")}', 
-                        '{meeting_date.strftime("%Y-%m-%d")}',
+                        '{call_id}', 
+                        '{call_title.replace("'", "''")}', 
+                        '{call_date.strftime("%Y-%m-%d")}',
                         '{stage_path}',
                         'completed',
                         'pending',
@@ -286,7 +286,7 @@ def start_transcription(
                     cursor.execute(insert_sql)
                     
                     # Save transcription to TRANSCRIPTIONS stage
-                    transcription_path = f"{config.STAGE_TRANSCRIPTIONS}/{meeting_id}_transcript.json"
+                    transcription_path = f"{config.STAGE_TRANSCRIPTIONS}/{call_id}_transcript.json"
                     
                     # Parse and save contributions - merge consecutive segments from same speaker
                     if transcription:
@@ -328,7 +328,7 @@ def start_transcription(
                         
                         # Insert merged segments as contributions
                         for idx, seg in enumerate(merged_segments):
-                            contrib_id = f"{meeting_id}_{idx:04d}"
+                            contrib_id = f"{call_id}_{idx:04d}"
                             start_time = seg.get("start", 0)
                             end_time = seg.get("end", 0)
                             duration = end_time - start_time if end_time > start_time else 0
@@ -336,15 +336,15 @@ def start_transcription(
                             word_count = len(text.split())
                             
                             insert_contrib = f"""
-                            INSERT INTO MEETING_CONTRIBUTIONS (
-                                CONTRIBUTION_ID, MEETING_ID, SEGMENT_NUMBER,
+                            INSERT INTO CALL_CONTRIBUTIONS (
+                                CONTRIBUTION_ID, CALL_ID, SEGMENT_NUMBER,
                                 DIARIZATION_LABEL, TEXT_CONTENT,
                                 START_TIME_SECONDS, END_TIME_SECONDS, 
                                 DURATION_SECONDS, WORD_COUNT,
                                 CLASSIFICATION_STATUS, CREATED_AT
                             ) VALUES (
                                 '{contrib_id}',
-                                '{meeting_id}',
+                                '{call_id}',
                                 {idx},
                                 '{seg.get("speaker_label", "UNKNOWN")}',
                                 '{text.replace("'", "''")}',
@@ -358,25 +358,25 @@ def start_transcription(
                             """
                             cursor.execute(insert_contrib)
                     
-                    return meeting_id
+                    return call_id
                 else:
                     raise SnowflakeClientError(f"Transcription failed: {data.get('message')}")
             except json.JSONDecodeError:
-                # Result might be the meeting ID directly
-                return str(result[0]) if result[0] else meeting_id
+                # Result might be the call ID directly
+                return str(result[0]) if result[0] else call_id
         
-        return meeting_id
+        return call_id
         
     finally:
         conn.close()
 
 
-def start_speaker_identification(meeting_id: str, threshold: float = None) -> Dict[str, Any]:
+def start_speaker_identification(call_id: str, threshold: float = None) -> Dict[str, Any]:
     """
-    Start speaker identification for a meeting
+    Start speaker identification for a call
     
     Args:
-        meeting_id: Meeting ID to process
+        call_id: Call ID to process
         threshold: Confidence threshold for auto-matching
         
     Returns:
@@ -395,10 +395,10 @@ def start_speaker_identification(meeting_id: str, threshold: float = None) -> Di
         cursor.execute(f"USE WAREHOUSE {config.SNOWFLAKE_WAREHOUSE}")
         
         # Call speaker identification procedure (groups by diarization, queues for review)
-        cursor.execute(f"CALL IDENTIFY_MEETING_SPEAKERS_WITH_EMBEDDINGS('{meeting_id}', {threshold})")
+        cursor.execute(f"CALL IDENTIFY_CALL_SPEAKERS_WITH_EMBEDDINGS('{call_id}', {threshold})")
         result = cursor.fetchone()
         
-        identification_result = {"status": "started", "meeting_id": meeting_id}
+        identification_result = {"status": "started", "call_id": call_id}
         if result:
             import json
             try:
@@ -408,7 +408,7 @@ def start_speaker_identification(meeting_id: str, threshold: float = None) -> Di
         
         # Run automatic speaker detection using voiceprints
         try:
-            cursor.execute(f"CALL AUTO_DETECT_SPEAKERS('{meeting_id}', {threshold})")
+            cursor.execute(f"CALL AUTO_DETECT_SPEAKERS('{call_id}', {threshold})")
             auto_result = cursor.fetchone()
             if auto_result:
                 import json
@@ -427,9 +427,9 @@ def start_speaker_identification(meeting_id: str, threshold: float = None) -> Di
         conn.close()
 
 
-def get_meeting_status(meeting_id: str) -> Dict[str, Any]:
+def get_call_status(call_id: str) -> Dict[str, Any]:
     """
-    Get the current status of a meeting
+    Get the current status of a call
     
     Returns dict with: status, title, total_contributions, identified_contributions, etc.
     """
@@ -441,24 +441,24 @@ def get_meeting_status(meeting_id: str) -> Dict[str, Any]:
         cursor.execute(f"USE DATABASE {config.SNOWFLAKE_DATABASE}")
         cursor.execute(f"USE SCHEMA {config.SNOWFLAKE_SCHEMA}")
         
-        # Get meeting info
+        # Get call info
         cursor.execute(f"""
             SELECT 
-                m.MEETING_ID,
-                m.TITLE,
-                m.MEETING_DATE,
-                m.TRANSCRIPTION_STATUS,
-                m.CLASSIFICATION_STATUS,
-                m.TOTAL_SPEAKERS,
-                m.LANGUAGE,
-                m.DURATION_MINUTES
-            FROM MEETINGS m
-            WHERE m.MEETING_ID = '{meeting_id}'
+                c.CALL_ID,
+                c.TITLE,
+                c.CALL_DATE,
+                c.TRANSCRIPTION_STATUS,
+                c.CLASSIFICATION_STATUS,
+                c.TOTAL_SPEAKERS,
+                c.LANGUAGE,
+                c.DURATION_MINUTES
+            FROM CALLS c
+            WHERE c.CALL_ID = '{call_id}'
         """)
-        meeting = cursor.fetchone()
+        call = cursor.fetchone()
         
-        if not meeting:
-            return {"status": "not_found", "meeting_id": meeting_id}
+        if not call:
+            return {"status": "not_found", "call_id": call_id}
         
         # Get contribution counts
         cursor.execute(f"""
@@ -466,33 +466,33 @@ def get_meeting_status(meeting_id: str) -> Dict[str, Any]:
                 COUNT(*) as total,
                 COUNT(IDENTIFIED_SPEAKER_ID) as identified,
                 COUNT(CASE WHEN CLASSIFICATION_STATUS = 'pending' THEN 1 END) as pending
-            FROM MEETING_CONTRIBUTIONS
-            WHERE MEETING_ID = '{meeting_id}'
+            FROM CALL_CONTRIBUTIONS
+            WHERE CALL_ID = '{call_id}'
         """)
         counts = cursor.fetchone()
         
         # Determine overall status
-        if meeting.get("TRANSCRIPTION_STATUS") == "pending":
-            status = MeetingStatus.TRANSCRIBING
+        if call.get("TRANSCRIPTION_STATUS") == "pending":
+            status = CallStatus.TRANSCRIBING
         elif counts and counts["TOTAL"] > 0 and counts["IDENTIFIED"] == counts["TOTAL"]:
-            status = MeetingStatus.COMPLETED
-        elif meeting.get("CLASSIFICATION_STATUS") == "completed":
-            status = MeetingStatus.COMPLETED
+            status = CallStatus.COMPLETED
+        elif call.get("CLASSIFICATION_STATUS") == "completed":
+            status = CallStatus.COMPLETED
         elif counts and counts["IDENTIFIED"] > 0:
-            status = MeetingStatus.IN_PROGRESS
+            status = CallStatus.IN_PROGRESS
         else:
-            status = MeetingStatus.PENDING
+            status = CallStatus.PENDING
         
         return {
             "status": status,
-            "meeting_id": meeting_id,
-            "title": meeting.get("TITLE"),
-            "meeting_date": meeting.get("MEETING_DATE"),
-            "transcription_status": meeting.get("TRANSCRIPTION_STATUS"),
-            "classification_status": meeting.get("CLASSIFICATION_STATUS"),
-            "total_speakers": meeting.get("TOTAL_SPEAKERS"),
-            "language": meeting.get("LANGUAGE"),
-            "duration_minutes": meeting.get("DURATION_MINUTES"),
+            "call_id": call_id,
+            "title": call.get("TITLE"),
+            "call_date": call.get("CALL_DATE"),
+            "transcription_status": call.get("TRANSCRIPTION_STATUS"),
+            "classification_status": call.get("CLASSIFICATION_STATUS"),
+            "total_speakers": call.get("TOTAL_SPEAKERS"),
+            "language": call.get("LANGUAGE"),
+            "duration_minutes": call.get("DURATION_MINUTES"),
             "total_contributions": counts["TOTAL"] if counts else 0,
             "identified_contributions": counts["IDENTIFIED"] if counts else 0,
             "pending_contributions": counts["PENDING"] if counts else 0
@@ -502,16 +502,16 @@ def get_meeting_status(meeting_id: str) -> Dict[str, Any]:
         conn.close()
 
 
-def list_meetings(limit: int = 10, status_filter: str = None) -> List[Dict[str, Any]]:
+def list_calls(limit: int = 10, status_filter: str = None) -> List[Dict[str, Any]]:
     """
-    List recent meetings with their status
+    List recent calls with their status
     
     Args:
-        limit: Maximum number of meetings to return
+        limit: Maximum number of calls to return
         status_filter: Optional status filter (pending, in_progress, completed)
         
     Returns:
-        List of meeting status dicts
+        List of call status dicts
     """
     conn = get_connection()
     try:
@@ -524,51 +524,51 @@ def list_meetings(limit: int = 10, status_filter: str = None) -> List[Dict[str, 
         # Build query
         query = f"""
             SELECT 
-                m.MEETING_ID,
-                m.TITLE,
-                m.MEETING_DATE,
-                m.TRANSCRIPTION_STATUS,
-                m.CLASSIFICATION_STATUS,
-                m.CREATED_AT,
-                COUNT(mc.CONTRIBUTION_ID) as TOTAL_CONTRIBUTIONS,
-                COUNT(mc.IDENTIFIED_SPEAKER_ID) as IDENTIFIED_CONTRIBUTIONS
-            FROM MEETINGS m
-            LEFT JOIN MEETING_CONTRIBUTIONS mc ON m.MEETING_ID = mc.MEETING_ID
+                c.CALL_ID,
+                c.TITLE,
+                c.CALL_DATE,
+                c.TRANSCRIPTION_STATUS,
+                c.CLASSIFICATION_STATUS,
+                c.CREATED_AT,
+                COUNT(cc.CONTRIBUTION_ID) as TOTAL_CONTRIBUTIONS,
+                COUNT(cc.IDENTIFIED_SPEAKER_ID) as IDENTIFIED_CONTRIBUTIONS
+            FROM CALLS c
+            LEFT JOIN CALL_CONTRIBUTIONS cc ON c.CALL_ID = cc.CALL_ID
         """
         
         if status_filter:
-            query += f" WHERE m.CLASSIFICATION_STATUS = '{status_filter}'"
+            query += f" WHERE c.CLASSIFICATION_STATUS = '{status_filter}'"
         
         query += f"""
-            GROUP BY m.MEETING_ID, m.TITLE, m.MEETING_DATE, 
-                     m.TRANSCRIPTION_STATUS, m.CLASSIFICATION_STATUS, m.CREATED_AT
-            ORDER BY m.CREATED_AT DESC
+            GROUP BY c.CALL_ID, c.TITLE, c.CALL_DATE, 
+                     c.TRANSCRIPTION_STATUS, c.CLASSIFICATION_STATUS, c.CREATED_AT
+            ORDER BY c.CREATED_AT DESC
             LIMIT {limit}
         """
         
         cursor.execute(query)
-        meetings = cursor.fetchall()
+        calls = cursor.fetchall()
         
         results = []
-        for m in meetings:
-            total = m.get("TOTAL_CONTRIBUTIONS", 0)
-            identified = m.get("IDENTIFIED_CONTRIBUTIONS", 0)
+        for c in calls:
+            total = c.get("TOTAL_CONTRIBUTIONS", 0)
+            identified = c.get("IDENTIFIED_CONTRIBUTIONS", 0)
             
-            if m.get("TRANSCRIPTION_STATUS") == "pending":
-                status = MeetingStatus.TRANSCRIBING
+            if c.get("TRANSCRIPTION_STATUS") == "pending":
+                status = CallStatus.TRANSCRIBING
             elif total > 0 and identified == total:
-                status = MeetingStatus.COMPLETED
-            elif m.get("CLASSIFICATION_STATUS") == "completed":
-                status = MeetingStatus.COMPLETED
+                status = CallStatus.COMPLETED
+            elif c.get("CLASSIFICATION_STATUS") == "completed":
+                status = CallStatus.COMPLETED
             elif identified > 0:
-                status = MeetingStatus.IN_PROGRESS
+                status = CallStatus.IN_PROGRESS
             else:
-                status = MeetingStatus.PENDING
+                status = CallStatus.PENDING
             
             results.append({
-                "meeting_id": m.get("MEETING_ID"),
-                "title": m.get("TITLE"),
-                "meeting_date": m.get("MEETING_DATE"),
+                "call_id": c.get("CALL_ID"),
+                "title": c.get("TITLE"),
+                "call_date": c.get("CALL_DATE"),
                 "status": status,
                 "total_contributions": total,
                 "identified_contributions": identified,
@@ -581,12 +581,12 @@ def list_meetings(limit: int = 10, status_filter: str = None) -> List[Dict[str, 
         conn.close()
 
 
-def get_transcript(meeting_id: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+def get_transcript(call_id: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """
-    Get the full transcript for a meeting with speaker names
+    Get the full transcript for a call with speaker names
     
     Returns:
-        Tuple of (meeting_info, contributions_list)
+        Tuple of (call_info, contributions_list)
     """
     conn = get_connection()
     try:
@@ -596,34 +596,34 @@ def get_transcript(meeting_id: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]
         cursor.execute(f"USE DATABASE {config.SNOWFLAKE_DATABASE}")
         cursor.execute(f"USE SCHEMA {config.SNOWFLAKE_SCHEMA}")
         
-        # Get meeting info
+        # Get call info
         cursor.execute(f"""
             SELECT 
-                MEETING_ID, TITLE, MEETING_DATE, DURATION_MINUTES,
+                CALL_ID, TITLE, CALL_DATE, DURATION_MINUTES,
                 TOTAL_SPEAKERS, LANGUAGE, SUMMARY
-            FROM MEETINGS
-            WHERE MEETING_ID = '{meeting_id}'
+            FROM CALLS
+            WHERE CALL_ID = '{call_id}'
         """)
-        meeting = cursor.fetchone()
+        call = cursor.fetchone()
         
-        if not meeting:
-            raise SnowflakeClientError(f"Meeting not found: {meeting_id}")
+        if not call:
+            raise SnowflakeClientError(f"Call not found: {call_id}")
         
         # Get contributions with speaker names
         cursor.execute(f"""
             SELECT 
-                mc.SEGMENT_NUMBER,
-                mc.DIARIZATION_LABEL,
-                mc.IDENTIFIED_SPEAKER_ID,
-                COALESCE(s.DISPLAY_NAME, mc.DIARIZATION_LABEL) as SPEAKER_NAME,
-                mc.TEXT_CONTENT,
-                mc.START_TIME_SECONDS,
-                mc.END_TIME_SECONDS,
-                mc.DURATION_SECONDS
-            FROM MEETING_CONTRIBUTIONS mc
-            LEFT JOIN SPEAKERS s ON mc.IDENTIFIED_SPEAKER_ID = s.SPEAKER_ID
-            WHERE mc.MEETING_ID = '{meeting_id}'
-            ORDER BY mc.SEGMENT_NUMBER
+                cc.SEGMENT_NUMBER,
+                cc.DIARIZATION_LABEL,
+                cc.IDENTIFIED_SPEAKER_ID,
+                COALESCE(s.DISPLAY_NAME, cc.DIARIZATION_LABEL) as SPEAKER_NAME,
+                cc.TEXT_CONTENT,
+                cc.START_TIME_SECONDS,
+                cc.END_TIME_SECONDS,
+                cc.DURATION_SECONDS
+            FROM CALL_CONTRIBUTIONS cc
+            LEFT JOIN SPEAKERS s ON cc.IDENTIFIED_SPEAKER_ID = s.SPEAKER_ID
+            WHERE cc.CALL_ID = '{call_id}'
+            ORDER BY cc.SEGMENT_NUMBER
         """)
         contributions = cursor.fetchall()
         
@@ -632,24 +632,24 @@ def get_transcript(meeting_id: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]
         for c in contributions:
             speakers.add(c.get("SPEAKER_NAME"))
         
-        meeting_info = {
-            "meeting_id": meeting.get("MEETING_ID"),
-            "title": meeting.get("TITLE"),
-            "meeting_date": meeting.get("MEETING_DATE"),
-            "duration_minutes": meeting.get("DURATION_MINUTES"),
-            "total_speakers": meeting.get("TOTAL_SPEAKERS"),
-            "language": meeting.get("LANGUAGE"),
-            "summary": meeting.get("SUMMARY"),
+        call_info = {
+            "call_id": call.get("CALL_ID"),
+            "title": call.get("TITLE"),
+            "call_date": call.get("CALL_DATE"),
+            "duration_minutes": call.get("DURATION_MINUTES"),
+            "total_speakers": call.get("TOTAL_SPEAKERS"),
+            "language": call.get("LANGUAGE"),
+            "summary": call.get("SUMMARY"),
             "speakers": sorted(list(speakers))
         }
         
-        return meeting_info, list(contributions)
+        return call_info, list(contributions)
         
     finally:
         conn.close()
 
 
-def is_meeting_complete(meeting_id: str) -> bool:
-    """Check if all speakers in a meeting have been identified"""
-    status = get_meeting_status(meeting_id)
-    return status.get("status") == MeetingStatus.COMPLETED
+def is_call_complete(call_id: str) -> bool:
+    """Check if all speakers in a call have been identified"""
+    status = get_call_status(call_id)
+    return status.get("status") == CallStatus.COMPLETED

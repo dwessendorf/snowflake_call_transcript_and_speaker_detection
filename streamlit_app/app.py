@@ -30,10 +30,10 @@ def run_query_df(sql):
     """Execute SQL and return results as pandas DataFrame"""
     return session.sql(sql).to_pandas()
 
-def get_audio_url(meeting_id):
-    """Get presigned URL for meeting audio"""
+def get_audio_url(call_id):
+    """Get presigned URL for call audio"""
     try:
-        result = run_query(f"SELECT recording_path FROM MEETINGS WHERE meeting_id = '{meeting_id}'")
+        result = run_query(f"SELECT recording_path FROM CALLS WHERE call_id = '{call_id}'")
         if not result or not result[0][0]:
             return None
         recording_path = result[0][0]
@@ -49,16 +49,16 @@ def get_audio_url(meeting_id):
     except Exception as e:
         return None
 
-def get_meetings(only_incomplete=True):
-    """Get meetings, optionally filtered to only incomplete ones"""
+def get_calls(only_incomplete=True):
+    """Get calls, optionally filtered to only incomplete ones"""
     filter_clause = "WHERE classification_status != 'completed'" if only_incomplete else ""
     results = run_query(f"""
-        SELECT meeting_id, title, meeting_date, classification_status,
-               (SELECT COUNT(*) FROM MEETING_CONTRIBUTIONS WHERE meeting_id = m.meeting_id) as total_contributions,
-               (SELECT COUNT(DISTINCT diarization_label) FROM MEETING_CONTRIBUTIONS WHERE meeting_id = m.meeting_id) as speaker_count
-        FROM MEETINGS m
+        SELECT call_id, title, call_date, classification_status,
+               (SELECT COUNT(*) FROM CALL_CONTRIBUTIONS WHERE call_id = m.call_id) as total_contributions,
+               (SELECT COUNT(DISTINCT diarization_label) FROM CALL_CONTRIBUTIONS WHERE call_id = m.call_id) as speaker_count
+        FROM CALLS m
         {filter_clause}
-        ORDER BY meeting_date DESC
+        ORDER BY call_date DESC
     """)
     return [(r[0], r[1], r[2], r[3], r[4], r[5]) for r in results]
 
@@ -67,7 +67,7 @@ def get_speakers():
     results = run_query("SELECT speaker_id, display_name, email FROM SPEAKERS ORDER BY display_name")
     return [(r[0], r[1], r[2]) for r in results]
 
-def get_diarization_groups(meeting_id):
+def get_diarization_groups(call_id):
     """Get contributions grouped by diarization label"""
     results = run_query(f"""
         SELECT 
@@ -76,14 +76,14 @@ def get_diarization_groups(meeting_id):
             SUM(end_time_seconds - start_time_seconds) as total_duration,
             LISTAGG(SUBSTR(text_content, 1, 100), ' | ') WITHIN GROUP (ORDER BY segment_number) as sample_text,
             MIN(identified_speaker_id) as current_speaker_id
-        FROM MEETING_CONTRIBUTIONS
-        WHERE meeting_id = '{meeting_id}'
+        FROM CALL_CONTRIBUTIONS
+        WHERE call_id = '{call_id}'
         GROUP BY diarization_label
         ORDER BY MIN(segment_number)
     """)
     return [(r[0], r[1], r[2], r[3], r[4]) for r in results]
 
-def get_segments_for_label(meeting_id, diarization_label):
+def get_segments_for_label(call_id, diarization_label):
     """Get individual segments for a diarization label"""
     results = run_query(f"""
         SELECT 
@@ -92,8 +92,8 @@ def get_segments_for_label(meeting_id, diarization_label):
             start_time_seconds,
             end_time_seconds,
             text_content
-        FROM MEETING_CONTRIBUTIONS
-        WHERE meeting_id = '{meeting_id}'
+        FROM CALL_CONTRIBUTIONS
+        WHERE call_id = '{call_id}'
         AND diarization_label = '{diarization_label}'
         ORDER BY segment_number
     """)
@@ -117,10 +117,10 @@ def compute_similarity(embedding1, embedding2):
     
     return dot_product / (norm1 * norm2)
 
-def extract_embedding_via_procedure(meeting_id, contribution_id):
+def extract_embedding_via_procedure(call_id, contribution_id):
     """Extract embedding using the Snowflake procedure"""
     try:
-        results = run_query(f"CALL EXTRACT_CONTRIBUTION_EMBEDDING('{meeting_id}', '{contribution_id}')")
+        results = run_query(f"CALL EXTRACT_CONTRIBUTION_EMBEDDING('{call_id}', '{contribution_id}')")
         result = results[0] if results else None
         
         if result and result[0]:
@@ -137,7 +137,7 @@ def extract_embedding_via_procedure(meeting_id, contribution_id):
     except Exception as e:
         return None, str(e)
 
-def assign_speaker_with_matching(meeting_id, diarization_label, speaker_id, speaker_name, threshold):
+def assign_speaker_with_matching(call_id, diarization_label, speaker_id, speaker_name, threshold):
     """
     Assign a speaker to a diarization label.
     Only extracts embeddings for segments >= 5 seconds.
@@ -160,8 +160,8 @@ def assign_speaker_with_matching(meeting_id, diarization_label, speaker_id, spea
         # Get all contributions for this label with their durations
         contributions = run_query(f"""
             SELECT contribution_id, duration_seconds
-            FROM MEETING_CONTRIBUTIONS
-            WHERE meeting_id = '{meeting_id}' 
+            FROM CALL_CONTRIBUTIONS
+            WHERE call_id = '{call_id}' 
             AND diarization_label = '{diarization_label}'
             ORDER BY segment_number
         """)
@@ -186,7 +186,7 @@ def assign_speaker_with_matching(meeting_id, diarization_label, speaker_id, spea
             best_duration = long_segments[0][1]
             
             # Extract embedding for the longest segment
-            embedding, error = extract_embedding_via_procedure(meeting_id, best_contribution_id)
+            embedding, error = extract_embedding_via_procedure(call_id, best_contribution_id)
             if embedding:
                 results['embedding_extracted'] = True
                 # Could save voiceprint here if needed in the future
@@ -196,19 +196,19 @@ def assign_speaker_with_matching(meeting_id, diarization_label, speaker_id, spea
         
         # Assign speaker to ALL contributions with this diarization label
         session.sql(f"""
-            UPDATE MEETING_CONTRIBUTIONS
+            UPDATE CALL_CONTRIBUTIONS
             SET identified_speaker_id = '{speaker_id}',
                 identification_method = 'manual',
                 identification_confidence = 1.0,
                 classification_status = 'classified'
-            WHERE meeting_id = '{meeting_id}' 
+            WHERE call_id = '{call_id}' 
             AND diarization_label = '{diarization_label}'
         """).collect()
         
         # Remove from classification queue
         session.sql(f"""
             DELETE FROM CLASSIFICATION_QUEUE 
-            WHERE meeting_id = '{meeting_id}'
+            WHERE call_id = '{call_id}'
             AND diarization_label = '{diarization_label}'
         """).collect()
         
@@ -221,13 +221,13 @@ def assign_speaker_with_matching(meeting_id, diarization_label, speaker_id, spea
         results['errors'].append(str(e))
         return results
 
-def delete_contributions(meeting_id, diarization_label):
-    """Delete all contributions for a specific diarization label from a meeting"""
+def delete_contributions(call_id, diarization_label):
+    """Delete all contributions for a specific diarization label from a call"""
     try:
         # Get count first
         count_result = run_query(f"""
-            SELECT COUNT(*) FROM MEETING_CONTRIBUTIONS
-            WHERE meeting_id = '{meeting_id}' 
+            SELECT COUNT(*) FROM CALL_CONTRIBUTIONS
+            WHERE call_id = '{call_id}' 
             AND diarization_label = '{diarization_label}'
         """)
         count = count_result[0][0] if count_result else 0
@@ -238,14 +238,14 @@ def delete_contributions(meeting_id, diarization_label):
         # Delete from classification queue first
         session.sql(f"""
             DELETE FROM CLASSIFICATION_QUEUE 
-            WHERE meeting_id = '{meeting_id}'
+            WHERE call_id = '{call_id}'
             AND diarization_label = '{diarization_label}'
         """).collect()
         
         # Delete contributions
         session.sql(f"""
-            DELETE FROM MEETING_CONTRIBUTIONS
-            WHERE meeting_id = '{meeting_id}' 
+            DELETE FROM CALL_CONTRIBUTIONS
+            WHERE call_id = '{call_id}' 
             AND diarization_label = '{diarization_label}'
         """).collect()
         
@@ -313,11 +313,11 @@ def update_speaker(speaker_id, name, email=None, department=None, company=None, 
         return False
 
 def delete_speaker(speaker_id):
-    """Delete a speaker (only if not used in any meetings)"""
+    """Delete a speaker (only if not used in any calls)"""
     try:
         # Check if speaker is used in any contributions
         count_result = run_query(f"""
-            SELECT COUNT(*) FROM MEETING_CONTRIBUTIONS
+            SELECT COUNT(*) FROM CALL_CONTRIBUTIONS
             WHERE identified_speaker_id = '{speaker_id}'
         """)
         count = count_result[0][0] if count_result else 0
@@ -331,23 +331,23 @@ def delete_speaker(speaker_id):
     except Exception as e:
         return False, str(e)
 
-def update_meeting_status(meeting_id):
-    """Update meeting status based on classification progress"""
+def update_call_status(call_id):
+    """Update call status based on classification progress"""
     # Check if all contributions are classified (either manually or auto)
     results = run_query(f"""
         SELECT 
             COUNT(*) as total,
             SUM(CASE WHEN classification_status IN ('classified', 'auto_classified') THEN 1 ELSE 0 END) as classified
-        FROM MEETING_CONTRIBUTIONS
-        WHERE meeting_id = '{meeting_id}'
+        FROM CALL_CONTRIBUTIONS
+        WHERE call_id = '{call_id}'
     """)
     
     if results:
         total, classified = results[0][0], results[0][1]
         if total == classified and total > 0:
             session.sql(f"""
-                UPDATE MEETINGS SET classification_status = 'completed'
-                WHERE meeting_id = '{meeting_id}'
+                UPDATE CALLS SET classification_status = 'completed'
+                WHERE call_id = '{call_id}'
             """).collect()
 
 # Sidebar - Speaker Management
@@ -453,81 +453,81 @@ if 'show_only_incomplete' not in st.session_state:
 # Filter toggle
 filter_col1, filter_col2 = st.columns([3, 1])
 with filter_col1:
-    st.subheader("📋 Meetings")
+    st.subheader("📋 Calls")
 with filter_col2:
     show_filter = st.selectbox(
         "Filter",
-        options=["Nur unvollständige", "Alle Meetings"],
+        options=["Nur unvollständige", "Alle Calls"],
         index=0 if st.session_state.show_only_incomplete else 1,
-        key="meeting_filter",
+        key="call_filter",
         label_visibility="collapsed"
     )
     st.session_state.show_only_incomplete = (show_filter == "Nur unvollständige")
 
-meetings = get_meetings(only_incomplete=st.session_state.show_only_incomplete)
+calls = get_calls(only_incomplete=st.session_state.show_only_incomplete)
 
-if not meetings:
+if not calls:
     if st.session_state.show_only_incomplete:
-        st.success("🎉 Alle Meetings sind vollständig klassifiziert!")
-        st.info("Wählen Sie 'Alle Meetings' um abgeschlossene Meetings anzuzeigen.")
+        st.success("🎉 Alle Calls sind vollständig klassifiziert!")
+        st.info("Wählen Sie 'Alle Calls' um abgeschlossene Calls anzuzeigen.")
     else:
-        st.info("Keine Meetings gefunden. Laden Sie ein Meeting über die CLI hoch.")
+        st.info("Keine Calls gefunden. Laden Sie ein Call über die CLI hoch.")
 else:
-    # Initialize session state for meeting selection
-    if 'selected_meeting_id' not in st.session_state:
-        st.session_state.selected_meeting_id = meetings[0][0]
+    # Initialize session state for call selection
+    if 'selected_call_id' not in st.session_state:
+        st.session_state.selected_call_id = calls[0][0]
     
-    # Find current index based on stored meeting_id
+    # Find current index based on stored call_id
     current_idx = 0
-    for i, m in enumerate(meetings):
-        if m[0] == st.session_state.selected_meeting_id:
+    for i, m in enumerate(calls):
+        if m[0] == st.session_state.selected_call_id:
             current_idx = i
             break
     
-    # If stored meeting not in current list, reset to first
-    if current_idx == 0 and meetings[0][0] != st.session_state.selected_meeting_id:
-        st.session_state.selected_meeting_id = meetings[0][0]
+    # If stored call not in current list, reset to first
+    if current_idx == 0 and calls[0][0] != st.session_state.selected_call_id:
+        st.session_state.selected_call_id = calls[0][0]
     
-    # Meeting selector
-    meeting_options = [f"{m[1]} ({m[3]})" for m in meetings]
+    # Call selector
+    call_options = [f"{m[1]} ({m[3]})" for m in calls]
     selected_idx = st.selectbox(
-        "Meeting auswählen", 
-        range(len(meetings)), 
+        "Call auswählen", 
+        range(len(calls)), 
         index=current_idx,
-        format_func=lambda i: meeting_options[i],
-        key="meeting_selector"
+        format_func=lambda i: call_options[i],
+        key="call_selector"
     )
     
     # Update session state when selection changes
-    st.session_state.selected_meeting_id = meetings[selected_idx][0]
+    st.session_state.selected_call_id = calls[selected_idx][0]
     
-    selected_meeting = meetings[selected_idx]
-    meeting_id = selected_meeting[0]
+    selected_call = calls[selected_idx]
+    call_id = selected_call[0]
     
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("Beiträge", selected_meeting[4])
+        st.metric("Beiträge", selected_call[4])
     with col2:
-        st.metric("Erkannte Stimmen", selected_meeting[5])
+        st.metric("Erkannte Stimmen", selected_call[5])
     with col3:
-        st.metric("Status", selected_meeting[3])
+        st.metric("Status", selected_call[3])
     
     st.divider()
     
     # Get diarization groups
-    groups = get_diarization_groups(meeting_id)
+    groups = get_diarization_groups(call_id)
     
     if not groups:
-        st.warning("Keine Beiträge für dieses Meeting gefunden.")
+        st.warning("Keine Beiträge für dieses Call gefunden.")
     else:
         # Build ONE HTML component with audio player + all seek buttons
-        audio_url = get_audio_url(meeting_id)
+        audio_url = get_audio_url(call_id)
         if audio_url:
             # Build buttons for each speaker group
             buttons_html = ""
             for group in groups:
                 label = group[0]
-                segments = get_segments_for_label(meeting_id, label)
+                segments = get_segments_for_label(call_id, label)
                 if segments:
                     first_start_sec = segments[0][2] or 0
                     start_fmt = f"{int(first_start_sec//60)}:{int(first_start_sec%60):02d}"
@@ -540,7 +540,7 @@ else:
             
             audio_html = f"""
             <div style="background: #1e1e1e; padding: 15px; border-radius: 10px;">
-                <audio id="meeting_audio" controls style="width: 100%;" preload="metadata">
+                <audio id="call_audio" controls style="width: 100%;" preload="metadata">
                     <source src="{audio_url}" type="audio/mpeg">
                 </audio>
                 <div style="margin-top: 10px;">
@@ -549,7 +549,7 @@ else:
                 </div>
             </div>
             <script>
-                var audioElement = document.getElementById('meeting_audio');
+                var audioElement = document.getElementById('call_audio');
                 function seekTo(seconds) {{
                     audioElement.currentTime = seconds;
                     audioElement.play();
@@ -580,7 +580,7 @@ else:
             current_speaker = group[4]
             
             # Get segments for this group
-            segments = get_segments_for_label(meeting_id, label) if audio_url else []
+            segments = get_segments_for_label(call_id, label) if audio_url else []
             
             # Check if already assigned
             is_assigned = current_speaker is not None
@@ -649,7 +649,7 @@ else:
                                 with st.spinner(f"Verarbeite {label}... (Embedding-Extraktion kann dauern)"):
                                     # Use enhanced matching
                                     result = assign_speaker_with_matching(
-                                        meeting_id, label, new_speaker_id, new_speaker_name, SIMILARITY_THRESHOLD
+                                        call_id, label, new_speaker_id, new_speaker_name, SIMILARITY_THRESHOLD
                                     )
                                     
                                     if result['success']:
@@ -673,7 +673,7 @@ else:
                                             msg += f"\n⚠️ Hinweise: {', '.join(result['errors'][:2])}"
                                         
                                         st.success(msg)
-                                        update_meeting_status(meeting_id)
+                                        update_call_status(call_id)
                                         st.experimental_rerun()
                                     else:
                                         errors = ", ".join(result['errors']) if result['errors'] else "Unbekannter Fehler"
@@ -691,11 +691,11 @@ else:
                     confirm_col1, confirm_col2, confirm_col3 = st.columns([1, 1, 4])
                     with confirm_col1:
                         if st.button("✓ Ja", key=f"confirm_yes_{label}"):
-                            success, message = delete_contributions(meeting_id, label)
+                            success, message = delete_contributions(call_id, label)
                             if success:
                                 st.success(message)
                                 del st.session_state[f'confirm_delete_{label}']
-                                update_meeting_status(meeting_id)
+                                update_call_status(call_id)
                                 st.experimental_rerun()
                             else:
                                 st.error(f"Fehler: {message}")
@@ -711,10 +711,10 @@ else:
         st.progress(progress, text=f"Fortschritt: {assignments_made}/{total_groups} Sprecher zugeordnet")
         
         if assignments_made == total_groups:
-            st.success("✅ Alle Sprecher zugeordnet! Meeting ist bereit für den Export.")
+            st.success("✅ Alle Sprecher zugeordnet! Call ist bereit für den Export.")
             if st.button("🔄 Seite aktualisieren"):
                 st.experimental_rerun()
 
 # Footer
 st.markdown("---")
-st.caption("Meeting Transcription Agent - Speaker Classification mit Voice Matching")
+st.caption("Call Transcription - Speaker Classification mit Voice Matching")

@@ -1,31 +1,31 @@
 -- ============================================================================
--- Snowflake Speaker Detection - Database Setup
+-- Snowflake Call Transcript and Speaker Detection - Database Setup
 -- ============================================================================
 -- Run this script first to create the database, schema, and warehouse
 -- Requires ACCOUNTADMIN or equivalent privileges
 -- ============================================================================
 
 -- Create database
-CREATE DATABASE IF NOT EXISTS MEETING_AGENT_DB;
+CREATE DATABASE IF NOT EXISTS CALL_TRANSCRIPTS_DB;
 
 -- Create schema
-CREATE SCHEMA IF NOT EXISTS MEETING_AGENT_DB.MEETING_AGENT;
+CREATE SCHEMA IF NOT EXISTS CALL_TRANSCRIPTS_DB.TRANSCRIPTS;
 
 -- Use the schema
-USE SCHEMA MEETING_AGENT_DB.MEETING_AGENT;
+USE SCHEMA CALL_TRANSCRIPTS_DB.TRANSCRIPTS;
 
 -- Create warehouse (adjust size as needed)
-CREATE WAREHOUSE IF NOT EXISTS MEETING_AGENT_WH
+CREATE WAREHOUSE IF NOT EXISTS CALL_TRANSCRIPTS_WH
     WAREHOUSE_SIZE = 'SMALL'
     AUTO_SUSPEND = 300
     AUTO_RESUME = TRUE
     INITIALLY_SUSPENDED = TRUE
-    COMMENT = 'Warehouse for Meeting Agent operations';
+    COMMENT = 'Warehouse for call transcription operations';
 
 -- Grant usage
-GRANT USAGE ON DATABASE MEETING_AGENT_DB TO ROLE ACCOUNTADMIN;
-GRANT USAGE ON SCHEMA MEETING_AGENT_DB.MEETING_AGENT TO ROLE ACCOUNTADMIN;
-GRANT USAGE ON WAREHOUSE MEETING_AGENT_WH TO ROLE ACCOUNTADMIN;
+GRANT USAGE ON DATABASE CALL_TRANSCRIPTS_DB TO ROLE ACCOUNTADMIN;
+GRANT USAGE ON SCHEMA CALL_TRANSCRIPTS_DB.TRANSCRIPTS TO ROLE ACCOUNTADMIN;
+GRANT USAGE ON WAREHOUSE CALL_TRANSCRIPTS_WH TO ROLE ACCOUNTADMIN;
 
 -- Verify setup
 SELECT CURRENT_DATABASE(), CURRENT_SCHEMA();

@@ -1,19 +1,19 @@
 -- ============================================================================
--- Snowflake Speaker Detection - Stage Creation
+-- Snowflake Call Transcript and Speaker Detection - Stage Creation
 -- ============================================================================
 -- Creates internal stages for storing audio files and application assets
 -- ============================================================================
 
-USE SCHEMA MEETING_AGENT_DB.MEETING_AGENT;
+USE SCHEMA CALL_TRANSCRIPTS_DB.TRANSCRIPTS;
 
 -- ============================================================================
--- Stage for meeting recordings (audio/video files)
+-- Stage for call recordings (audio/video files)
 -- Using NO CSE for AI_TRANSCRIBE compatibility
 -- ============================================================================
-CREATE STAGE IF NOT EXISTS MEETING_RECORDINGS
+CREATE STAGE IF NOT EXISTS CALL_RECORDINGS
     DIRECTORY = (ENABLE = TRUE)
     ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE')
-    COMMENT = 'Storage for meeting audio/video recordings';
+    COMMENT = 'Storage for call audio/video recordings';
 
 -- ============================================================================
 -- Stage for audio snippets (extracted segments)
@@ -50,9 +50,9 @@ CREATE STAGE IF NOT EXISTS STREAMLIT_APPS
 -- ============================================================================
 -- Stage for transcription outputs (optional)
 -- ============================================================================
-CREATE STAGE IF NOT EXISTS MEETING_TRANSCRIPTIONS
+CREATE STAGE IF NOT EXISTS CALL_TRANSCRIPTIONS
     DIRECTORY = (ENABLE = TRUE)
-    COMMENT = 'Storage for meeting transcription outputs';
+    COMMENT = 'Storage for call transcription outputs';
 
 -- Verify stages created
-SHOW STAGES IN SCHEMA MEETING_AGENT_DB.MEETING_AGENT;
+SHOW STAGES IN SCHEMA CALL_TRANSCRIPTS_DB.TRANSCRIPTS;

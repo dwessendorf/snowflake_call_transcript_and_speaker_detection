@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Setup script for Meeting Upload CLI
+Setup script for Call Upload CLI
 """
 
 from setuptools import setup, find_packages
 
 setup(
-    name="meeting-cli",
+    name="call-cli",
     version="1.0.0",
-    description="Upload meeting recordings, monitor transcription, and export transcripts",
-    author="Meeting Transcription Agent",
+    description="Upload call recordings, monitor transcription, and export transcripts",
+    author="Call Transcription Team",
     python_requires=">=3.8",
     packages=find_packages(),
     install_requires=[
@@ -19,7 +19,7 @@ setup(
     ],
     entry_points={
         "console_scripts": [
-            "meeting-cli=cli.meeting_cli:main",
+            "call-cli=cli.call_cli:main",
         ],
     },
     classifiers=[
