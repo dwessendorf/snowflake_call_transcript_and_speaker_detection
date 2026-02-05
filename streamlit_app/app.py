@@ -531,23 +531,26 @@ if speakers:
 
 st.sidebar.divider()
 
-# CSV Import
+# CSV Import - using text area instead of file_uploader (not supported in SiS 1.22)
 st.sidebar.subheader("📤 CSV Import")
-uploaded_file = st.sidebar.file_uploader(
-    "Sprecher aus CSV importieren",
-    type=['csv'],
-    help="CSV mit Spalten: name, email, department, company, meeting_count"
-)
-
-if uploaded_file is not None:
-    if st.sidebar.button("📥 Importieren"):
-        content = uploaded_file.getvalue().decode('utf-8')
-        success, msg = import_speakers_from_csv(content)
-        if success:
-            st.sidebar.success(msg)
-            st.experimental_rerun()
+with st.sidebar.expander("CSV einfügen"):
+    st.caption("Spalten: name, email, department, company, meeting_count")
+    csv_text = st.text_area(
+        "CSV Inhalt",
+        height=150,
+        placeholder="name,email,meeting_count\nMax Mustermann,max@example.com,5\n...",
+        key="csv_import_text"
+    )
+    if st.button("📥 Importieren", key="import_csv_btn"):
+        if csv_text and csv_text.strip():
+            success, msg = import_speakers_from_csv(csv_text)
+            if success:
+                st.success(msg)
+                st.experimental_rerun()
+            else:
+                st.error(msg)
         else:
-            st.sidebar.error(msg)
+            st.warning("Bitte CSV-Daten einfügen")
 
 st.sidebar.divider()
 st.sidebar.subheader("➕ Neuen Sprecher anlegen")
