@@ -136,26 +136,6 @@ def get_segments_for_label(call_id, diarization_label):
     """).collect()
     return [(r[0], r[1], r[2], r[3], r[4]) for r in results]
 
-def extract_embedding_via_procedure(call_id, contribution_id):
-    """Extract embedding using the Snowflake procedure"""
-    try:
-        results = run_query(f"CALL EXTRACT_CONTRIBUTION_EMBEDDING('{call_id}', '{contribution_id}')")
-        result = results[0] if results else None
-        
-        if result and result[0]:
-            data = result[0]
-            if isinstance(data, str):
-                data = json.loads(data)
-            
-            if data.get('status') == 'success':
-                return data.get('embedding'), None
-            else:
-                return None, data.get('message', 'Unknown error')
-        
-        return None, "No result from procedure"
-    except Exception as e:
-        return None, str(e)
-
 def increment_speaker_meeting_count(speaker_id):
     """Increment the meeting count for a speaker"""
     try:
@@ -169,38 +149,19 @@ def increment_speaker_meeting_count(speaker_id):
     except:
         return False
 
-def match_voiceprint_against_embeddings(speaker_id, source_call_id, threshold=0.75):
-    """Match a speaker's voiceprint against pre-computed embeddings in other calls."""
-    try:
-        results = run_query(f"""
-            CALL MATCH_VOICEPRINT_AGAINST_EMBEDDINGS('{speaker_id}', '{source_call_id}', {threshold})
-        """)
-        if results and results[0][0]:
-            data = results[0][0]
-            if isinstance(data, str):
-                data = json.loads(data)
-            return data
-        return {'message': 'No result from matching procedure'}
-    except Exception as e:
-        return {'errors': [str(e)]}
-
-def assign_speaker_with_matching(call_id, diarization_label, speaker_id, speaker_name, threshold):
-    """Assign a speaker to a diarization label."""
-    MIN_DURATION_FOR_EMBEDDING = 5.0
-    
+def assign_speaker_fast(call_id, diarization_label, speaker_id):
+    """
+    Fast speaker assignment - just updates the database.
+    Embeddings are pre-computed, matching happens in background task.
+    """
     results = {
         'success': False,
-        'embedding_extracted': False,
-        'voiceprint_saved': False,
-        'segments_tested': 0,
-        'auto_classified': 0,
-        'kept_for_review': 0,
-        'skipped_short': 0,
+        'segments_updated': 0,
         'errors': []
     }
     
     try:
-        # Check if speaker already in call
+        # Check if speaker already in call (for meeting count)
         existing = run_query(f"""
             SELECT COUNT(*) FROM CALL_CONTRIBUTIONS
             WHERE call_id = '{call_id}' 
@@ -209,36 +170,19 @@ def assign_speaker_with_matching(call_id, diarization_label, speaker_id, speaker
         """)
         speaker_already_in_call = existing[0][0] > 0 if existing else False
         
-        # Get contributions for this label
-        contributions = run_query(f"""
-            SELECT contribution_id, duration_seconds
-            FROM CALL_CONTRIBUTIONS
+        # Count segments to update
+        count_result = run_query(f"""
+            SELECT COUNT(*) FROM CALL_CONTRIBUTIONS
             WHERE call_id = '{call_id}' 
             AND diarization_label = '{diarization_label}'
-            ORDER BY segment_number
         """)
+        total_count = count_result[0][0] if count_result else 0
         
-        if not contributions:
-            results['errors'].append('No contributions found')
+        if total_count == 0:
+            results['errors'].append('Keine Beiträge gefunden')
             return results
         
-        total_count = len(contributions)
-        long_segments = [(c[0], c[1]) for c in contributions if (c[1] or 0) >= MIN_DURATION_FOR_EMBEDDING]
-        short_segments = [(c[0], c[1]) for c in contributions if (c[1] or 0) < MIN_DURATION_FOR_EMBEDDING]
-        
-        results['skipped_short'] = len(short_segments)
-        
-        # Extract embedding from longest segment
-        if long_segments:
-            long_segments.sort(key=lambda x: x[1] or 0, reverse=True)
-            best_contribution_id = long_segments[0][0]
-            embedding, error = extract_embedding_via_procedure(call_id, best_contribution_id)
-            if embedding:
-                results['embedding_extracted'] = True
-            elif error:
-                results['errors'].append(f"Embedding extraction: {error}")
-        
-        # Assign speaker
+        # Fast update - just assign the speaker
         session.sql(f"""
             UPDATE CALL_CONTRIBUTIONS
             SET identified_speaker_id = '{speaker_id}',
@@ -256,25 +200,21 @@ def assign_speaker_with_matching(call_id, diarization_label, speaker_id, speaker
             AND diarization_label = '{diarization_label}'
         """).collect()
         
+        # Remove from pre-computed embeddings (no longer needed)
+        session.sql(f"""
+            DELETE FROM CONTRIBUTION_EMBEDDINGS
+            WHERE call_id = '{call_id}'
+            AND diarization_label = '{diarization_label}'
+        """).collect()
+        
         # Increment meeting count
         if not speaker_already_in_call:
             increment_speaker_meeting_count(speaker_id)
         
         results['success'] = True
-        results['auto_classified'] = total_count
+        results['segments_updated'] = total_count
         
-        # Background matching
-        try:
-            match_result = match_voiceprint_against_embeddings(speaker_id, call_id, threshold)
-            if match_result.get('contributions_updated', 0) > 0:
-                results['background_matches'] = match_result.get('contributions_updated', 0)
-                results['background_calls'] = len(match_result.get('calls_affected', []))
-            if match_result.get('voiceprint_created'):
-                results['voiceprint_saved'] = True
-        except Exception as e:
-            results['errors'].append(f"Background matching: {str(e)}")
-        
-        # Clear caches after assignment
+        # Clear caches
         get_diarization_groups_cached.clear()
         get_speakers_cached.clear()
         
@@ -796,20 +736,15 @@ else:
                     with col_button:
                         if new_speaker_id and new_speaker_id != current_speaker:
                             if st.button(f"✓ Zuordnen", key=f"assign_{label}"):
-                                with st.spinner(f"Verarbeite {label}..."):
-                                    result = assign_speaker_with_matching(
-                                        call_id, label, new_speaker_id, selected_speaker_display, SIMILARITY_THRESHOLD
-                                    )
-                                    
-                                    if result['success']:
-                                        msg = f"✅ Zugeordnet! {result['auto_classified']} Segmente"
-                                        if result.get('background_matches', 0) > 0:
-                                            msg += f"\n🔄 {result['background_matches']} in anderen Calls!"
-                                        st.success(msg)
-                                        update_call_status(call_id)
-                                        st.experimental_rerun()
-                                    else:
-                                        st.error(f"Fehler: {', '.join(result['errors'])}")
+                                # Fast assignment - no embedding extraction
+                                result = assign_speaker_fast(call_id, label, new_speaker_id)
+                                
+                                if result['success']:
+                                    st.success(f"✅ {result['segments_updated']} Segmente zugeordnet!")
+                                    update_call_status(call_id)
+                                    st.experimental_rerun()
+                                else:
+                                    st.error(f"Fehler: {', '.join(result['errors'])}")
                         elif not new_speaker_id:
                             st.button("✓ Zuordnen", key=f"assign_{label}", disabled=True)
                     
