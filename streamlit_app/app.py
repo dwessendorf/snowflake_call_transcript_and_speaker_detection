@@ -422,7 +422,7 @@ if speakers:
                                 )
                                 if success:
                                     st.success("✅ Gespeichert!")
-                                    st.rerun()
+                                    st.experimental_rerun()
                             else:
                                 st.error("Name ist erforderlich")
                         
@@ -430,7 +430,7 @@ if speakers:
                             success, error = delete_speaker(speaker_id)
                             if success:
                                 st.success("✅ Gelöscht!")
-                                st.rerun()
+                                st.experimental_rerun()
                             else:
                                 st.error(f"❌ {error}")
 
@@ -456,7 +456,7 @@ with st.sidebar.form("new_speaker"):
             )
             if speaker_id:
                 st.sidebar.success(f"✅ {new_name} angelegt!")
-                st.rerun()
+                st.experimental_rerun()
         else:
             st.sidebar.error("Name ist erforderlich")
 
@@ -703,7 +703,7 @@ else:
                                         
                                         st.success(msg)
                                         update_call_status(call_id)
-                                        st.rerun()
+st.experimental_rerun()
                                     else:
                                         errors = ", ".join(result['errors']) if result['errors'] else "Unbekannter Fehler"
                                         st.error(f"Zuordnung fehlgeschlagen: {errors}")
@@ -725,13 +725,13 @@ else:
                                 st.success(message)
                                 del st.session_state[f'confirm_delete_{label}']
                                 update_call_status(call_id)
-                                st.rerun()
+                                st.experimental_rerun()
                             else:
                                 st.error(f"Fehler: {message}")
                     with confirm_col2:
                         if st.button("✗ Nein", key=f"confirm_no_{label}"):
                             del st.session_state[f'confirm_delete_{label}']
-                            st.rerun()
+                            st.experimental_rerun()
                 
                 st.divider()
         
@@ -742,7 +742,7 @@ else:
         if assignments_made == total_groups:
             st.success("✅ Alle Sprecher zugeordnet! Call ist bereit für den Export.")
             if st.button("🔄 Seite aktualisieren"):
-                st.rerun()
+                st.experimental_rerun()
 
 # Footer
 st.markdown("---")
