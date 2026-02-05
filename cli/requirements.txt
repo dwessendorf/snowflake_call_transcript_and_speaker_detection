@@ -1,0 +1,6 @@
+click>=8.0.0
+rich>=13.0.0
+snowflake-connector-python[pandas]>=3.0.0
+snowflake-snowpark-python>=1.10.0
+pydub>=0.25.0
+python-dateutil>=2.8.0

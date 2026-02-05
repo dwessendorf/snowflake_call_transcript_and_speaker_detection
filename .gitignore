@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Snowflake
+*.p8
+*.pem
+.snowsql/
+
+# Secrets
+.env
+*.env
+credentials.json
+secrets.json
+
+# Audio files (don't commit test files)
+*.mp3
+*.m4a
+*.wav
+*.flac
+*.mp4
+*.mov
+
+# Logs
+*.log
+logs/
+
+# Temp files
+tmp/
+temp/
+*.tmp
+
+# Converted audio (CLI creates these)
+converted/
