@@ -8,7 +8,10 @@ import shutil
 from pathlib import Path
 from typing import Tuple, Optional
 
-from . import config
+try:
+    from . import config
+except ImportError:
+    import config
 
 
 class AudioConversionError(Exception):

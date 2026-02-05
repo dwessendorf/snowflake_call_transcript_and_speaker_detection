@@ -16,10 +16,16 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.panel import Panel
 from rich import print as rprint
 
-from . import config
-from . import audio
-from . import snowflake_client
-from . import transcript
+try:
+    from . import config
+    from . import audio
+    from . import snowflake_client
+    from . import transcript
+except ImportError:
+    import config
+    import audio
+    import snowflake_client
+    import transcript
 
 console = Console()
 

@@ -19,7 +19,7 @@ setup(
     ],
     entry_points={
         "console_scripts": [
-            "call-cli=cli.call_cli:main",
+            "call-cli=call_cli:main",
         ],
     },
     classifiers=[

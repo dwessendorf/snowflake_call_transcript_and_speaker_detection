@@ -7,7 +7,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 
-from . import config
+try:
+    from . import config
+except ImportError:
+    import config
 
 
 def format_timestamp(seconds: float) -> str:

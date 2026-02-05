@@ -12,7 +12,10 @@ from typing import Optional, List, Dict, Any, Tuple
 import snowflake.connector
 from snowflake.connector import DictCursor
 
-from . import config
+try:
+    from . import config
+except ImportError:
+    import config
 
 
 class SnowflakeClientError(Exception):
