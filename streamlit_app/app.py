@@ -155,6 +155,61 @@ def increment_speaker_meeting_count(speaker_id):
     except Exception as e:
         return False
 
+def match_voiceprint_against_embeddings(speaker_id, source_call_id, threshold=0.75):
+    """
+    Match a speaker's voiceprint against pre-computed embeddings in other calls.
+    Returns dict with match results.
+    """
+    try:
+        results = run_query(f"""
+            CALL MATCH_VOICEPRINT_AGAINST_EMBEDDINGS('{speaker_id}', '{source_call_id}', {threshold})
+        """)
+        if results and results[0][0]:
+            data = results[0][0]
+            if isinstance(data, str):
+                data = json.loads(data)
+            return data
+        return {'message': 'No result from matching procedure'}
+    except Exception as e:
+        return {'errors': [str(e)]}
+
+def precompute_call_embeddings(call_id):
+    """
+    Pre-compute embeddings for all unassigned contributions in a call.
+    Should be called after transcription completes.
+    """
+    try:
+        results = run_query(f"CALL PRECOMPUTE_CALL_EMBEDDINGS('{call_id}')")
+        if results and results[0][0]:
+            data = results[0][0]
+            if isinstance(data, str):
+                data = json.loads(data)
+            return data
+        return {'message': 'No result from precompute procedure'}
+    except Exception as e:
+        return {'errors': [str(e)]}
+
+def get_pending_embeddings_count():
+    """Get count of contributions waiting for embedding computation"""
+    try:
+        result = run_query("""
+            SELECT COUNT(*) FROM CALL_CONTRIBUTIONS cc
+            WHERE cc.identified_speaker_id IS NULL
+            AND cc.duration_seconds >= 5.0
+            AND cc.contribution_id NOT IN (SELECT contribution_id FROM CONTRIBUTION_EMBEDDINGS)
+        """)
+        return result[0][0] if result else 0
+    except:
+        return 0
+
+def get_stored_embeddings_count():
+    """Get count of pre-computed embeddings available for matching"""
+    try:
+        result = run_query("SELECT COUNT(*) FROM CONTRIBUTION_EMBEDDINGS")
+        return result[0][0] if result else 0
+    except:
+        return 0
+
 def assign_speaker_with_matching(call_id, diarization_label, speaker_id, speaker_name, threshold):
     """
     Assign a speaker to a diarization label.
@@ -246,6 +301,17 @@ def assign_speaker_with_matching(call_id, diarization_label, speaker_id, speaker
         
         results['success'] = True
         results['auto_classified'] = total_count
+        
+        # Background matching: match this speaker against pre-computed embeddings in other calls
+        try:
+            match_result = match_voiceprint_against_embeddings(speaker_id, call_id, threshold)
+            if match_result.get('contributions_updated', 0) > 0:
+                results['background_matches'] = match_result.get('contributions_updated', 0)
+                results['background_calls'] = len(match_result.get('calls_affected', []))
+            if match_result.get('voiceprint_created'):
+                results['voiceprint_saved'] = True
+        except Exception as e:
+            results['errors'].append(f"Background matching: {str(e)}")
         
         return results
         
@@ -591,6 +657,15 @@ threshold = st.sidebar.slider(
 )
 SIMILARITY_THRESHOLD = threshold
 
+# Background Matching Info
+st.sidebar.divider()
+st.sidebar.subheader("🔄 Auto-Matching")
+stored_embeddings = get_stored_embeddings_count()
+pending_embeddings = get_pending_embeddings_count()
+st.sidebar.metric("Gespeicherte Embeddings", stored_embeddings)
+st.sidebar.metric("Wartende Beiträge", pending_embeddings)
+st.sidebar.caption("Embeddings werden für Beiträge ≥5s berechnet")
+
 # Main content
 # Initialize filter state
 if 'show_only_incomplete' not in st.session_state:
@@ -650,13 +725,25 @@ else:
     selected_call = calls[selected_idx]
     call_id = selected_call[0]
     
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns([1, 1, 1, 2])
     with col1:
         st.metric("Beiträge", selected_call[4])
     with col2:
         st.metric("Erkannte Stimmen", selected_call[5])
     with col3:
         st.metric("Status", selected_call[3])
+    with col4:
+        # Button to precompute embeddings for this call
+        if st.button("🔄 Embeddings berechnen", help="Berechne Embeddings für unzugeordnete Beiträge"):
+            with st.spinner("Berechne Embeddings... (kann einige Minuten dauern)"):
+                result = precompute_call_embeddings(call_id)
+                if result.get('success', 0) > 0:
+                    st.success(f"✅ {result.get('success')} Embeddings berechnet!")
+                elif result.get('message'):
+                    st.info(result['message'])
+                if result.get('errors'):
+                    st.warning(f"⚠️ {len(result['errors'])} Fehler")
+                st.experimental_rerun()
     
     st.divider()
     
@@ -817,6 +904,9 @@ else:
                                             msg += f"\n✨ {result['auto_classified']} Segmente zugeordnet"
                                         if result['kept_for_review'] > 0:
                                             msg += f"\n⚠️ {result['kept_for_review']} zur Überprüfung"
+                                        # Show background matching results
+                                        if result.get('background_matches', 0) > 0:
+                                            msg += f"\n🔄 {result['background_matches']} Beiträge in {result.get('background_calls', 0)} anderen Call(s) automatisch zugeordnet!"
                                         if result['errors']:
                                             msg += f"\n⚠️ Hinweise: {', '.join(result['errors'][:2])}"
                                         
