@@ -664,7 +664,10 @@ stored_embeddings = get_stored_embeddings_count()
 pending_embeddings = get_pending_embeddings_count()
 st.sidebar.metric("Gespeicherte Embeddings", stored_embeddings)
 st.sidebar.metric("Wartende Beiträge", pending_embeddings)
-st.sidebar.caption("Embeddings werden für Beiträge ≥5s berechnet")
+if pending_embeddings > 0:
+    st.sidebar.caption("⏳ Embeddings werden automatisch berechnet (alle 5 Min)")
+else:
+    st.sidebar.caption("✅ Alle Embeddings berechnet")
 
 # Main content
 # Initialize filter state
@@ -725,25 +728,13 @@ else:
     selected_call = calls[selected_idx]
     call_id = selected_call[0]
     
-    col1, col2, col3, col4 = st.columns([1, 1, 1, 2])
+    col1, col2, col3 = st.columns(3)
     with col1:
         st.metric("Beiträge", selected_call[4])
     with col2:
         st.metric("Erkannte Stimmen", selected_call[5])
     with col3:
         st.metric("Status", selected_call[3])
-    with col4:
-        # Button to precompute embeddings for this call
-        if st.button("🔄 Embeddings berechnen", help="Berechne Embeddings für unzugeordnete Beiträge"):
-            with st.spinner("Berechne Embeddings... (kann einige Minuten dauern)"):
-                result = precompute_call_embeddings(call_id)
-                if result.get('success', 0) > 0:
-                    st.success(f"✅ {result.get('success')} Embeddings berechnet!")
-                elif result.get('message'):
-                    st.info(result['message'])
-                if result.get('errors'):
-                    st.warning(f"⚠️ {len(result['errors'])} Fehler")
-                st.experimental_rerun()
     
     st.divider()
     
