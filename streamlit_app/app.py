@@ -10,6 +10,7 @@ import pandas as pd
 import json
 import numpy as np
 import uuid
+import io
 from snowflake.snowpark.context import get_active_session
 
 st.set_page_config(page_title="Speaker Classification", page_icon="🎤", layout="wide")
@@ -63,9 +64,13 @@ def get_calls(only_incomplete=True):
     return [(r[0], r[1], r[2], r[3], r[4], r[5]) for r in results]
 
 def get_speakers():
-    """Get all registered speakers"""
-    results = run_query("SELECT speaker_id, display_name, email FROM SPEAKERS ORDER BY display_name")
-    return [(r[0], r[1], r[2]) for r in results]
+    """Get all registered speakers, sorted by meeting count descending"""
+    results = run_query("""
+        SELECT speaker_id, display_name, email, COALESCE(meeting_count, 0) as meeting_count 
+        FROM SPEAKERS 
+        ORDER BY meeting_count DESC, display_name ASC
+    """)
+    return [(r[0], r[1], r[2], r[3]) for r in results]
 
 def get_diarization_groups(call_id):
     """Get contributions grouped by diarization label"""
@@ -137,11 +142,25 @@ def extract_embedding_via_procedure(call_id, contribution_id):
     except Exception as e:
         return None, str(e)
 
+def increment_speaker_meeting_count(speaker_id):
+    """Increment the meeting count for a speaker"""
+    try:
+        session.sql(f"""
+            UPDATE SPEAKERS 
+            SET meeting_count = COALESCE(meeting_count, 0) + 1,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE speaker_id = '{speaker_id}'
+        """).collect()
+        return True
+    except Exception as e:
+        return False
+
 def assign_speaker_with_matching(call_id, diarization_label, speaker_id, speaker_name, threshold):
     """
     Assign a speaker to a diarization label.
     Only extracts embeddings for segments >= 5 seconds.
     Shorter segments are assigned without embedding extraction.
+    Also increments the speaker's meeting count.
     """
     MIN_DURATION_FOR_EMBEDDING = 5.0  # seconds
     
@@ -157,6 +176,15 @@ def assign_speaker_with_matching(call_id, diarization_label, speaker_id, speaker
     }
     
     try:
+        # Check if this speaker was already assigned to this call (to avoid double-counting)
+        existing = run_query(f"""
+            SELECT COUNT(*) FROM CALL_CONTRIBUTIONS
+            WHERE call_id = '{call_id}' 
+            AND identified_speaker_id = '{speaker_id}'
+            AND classification_status = 'classified'
+        """)
+        speaker_already_in_call = existing[0][0] > 0 if existing else False
+        
         # Get all contributions for this label with their durations
         contributions = run_query(f"""
             SELECT contribution_id, duration_seconds
@@ -212,6 +240,10 @@ def assign_speaker_with_matching(call_id, diarization_label, speaker_id, speaker
             AND diarization_label = '{diarization_label}'
         """).collect()
         
+        # Increment meeting count only if this is the first time this speaker appears in this call
+        if not speaker_already_in_call:
+            increment_speaker_meeting_count(speaker_id)
+        
         results['success'] = True
         results['auto_classified'] = total_count
         
@@ -253,20 +285,21 @@ def delete_contributions(call_id, diarization_label):
     except Exception as e:
         return False, str(e)
 
-def create_speaker(name, email=None, department=None, company=None, notes=None):
+def create_speaker(name, email=None, department=None, company=None, notes=None, meeting_count=0):
     """Create a new speaker"""
     speaker_id = f"SPK_{uuid.uuid4().hex[:16]}"
     
     try:
         # Build insert with proper escaping
+        name_escaped = name.replace("'", "''")
         email_val = f"'{email}'" if email else 'NULL'
         dept_val = f"'{department}'" if department else 'NULL'
         company_val = f"'{company}'" if company else 'NULL'
         notes_val = f"'{notes}'" if notes else 'NULL'
         
         session.sql(f"""
-            INSERT INTO SPEAKERS (speaker_id, display_name, email, department, company, notes, is_internal, created_at, updated_at, created_by)
-            VALUES ('{speaker_id}', '{name}', {email_val}, {dept_val}, {company_val}, {notes_val}, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_USER())
+            INSERT INTO SPEAKERS (speaker_id, display_name, email, department, company, notes, is_internal, meeting_count, created_at, updated_at, created_by)
+            VALUES ('{speaker_id}', '{name_escaped}', {email_val}, {dept_val}, {company_val}, {notes_val}, TRUE, {meeting_count}, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_USER())
         """).collect()
         return speaker_id
     except Exception as e:
@@ -276,19 +309,20 @@ def create_speaker(name, email=None, department=None, company=None, notes=None):
 def get_speaker_details(speaker_id):
     """Get full details of a speaker"""
     results = run_query(f"""
-        SELECT speaker_id, display_name, email, department, company, notes, is_internal
+        SELECT speaker_id, display_name, email, department, company, notes, is_internal, COALESCE(meeting_count, 0)
         FROM SPEAKERS
         WHERE speaker_id = '{speaker_id}'
     """)
     if results:
         r = results[0]
-        return (r[0], r[1], r[2], r[3], r[4], r[5], r[6])
+        return (r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7])
     return None
 
-def update_speaker(speaker_id, name, email=None, department=None, company=None, notes=None, is_internal=True):
+def update_speaker(speaker_id, name, email=None, department=None, company=None, notes=None, is_internal=True, meeting_count=None):
     """Update an existing speaker"""
     try:
         # Build update with proper escaping
+        name_escaped = name.replace("'", "''")
         email_val = f"'{email}'" if email else 'NULL'
         dept_val = f"'{department}'" if department else 'NULL'
         company_val = f"'{company}'" if company else 'NULL'
@@ -296,15 +330,18 @@ def update_speaker(speaker_id, name, email=None, department=None, company=None, 
         notes_val = f"'{notes_escaped}'" if notes_escaped else 'NULL'
         internal_val = 'TRUE' if is_internal else 'FALSE'
         
+        meeting_count_sql = f", meeting_count = {meeting_count}" if meeting_count is not None else ""
+        
         session.sql(f"""
             UPDATE SPEAKERS
-            SET display_name = '{name}',
+            SET display_name = '{name_escaped}',
                 email = {email_val},
                 department = {dept_val},
                 company = {company_val},
                 notes = {notes_val},
                 is_internal = {internal_val},
                 updated_at = CURRENT_TIMESTAMP
+                {meeting_count_sql}
             WHERE speaker_id = '{speaker_id}'
         """).collect()
         return True
@@ -357,6 +394,62 @@ def filter_speakers(speakers, search_term):
     search_lower = search_term.lower()
     return [s for s in speakers if search_lower in (s[1] or '').lower() or search_lower in (s[2] or '').lower()]
 
+def import_speakers_from_csv(csv_content):
+    """Import speakers from CSV content. Expected columns: name, email, department, company, meeting_count"""
+    try:
+        df = pd.read_csv(io.StringIO(csv_content))
+        
+        # Normalize column names
+        df.columns = df.columns.str.lower().str.strip()
+        
+        if 'name' not in df.columns and 'display_name' not in df.columns:
+            return False, "CSV muss eine 'name' oder 'display_name' Spalte haben"
+        
+        # Use display_name if name is not present
+        name_col = 'name' if 'name' in df.columns else 'display_name'
+        
+        imported = 0
+        updated = 0
+        errors = []
+        
+        for idx, row in df.iterrows():
+            name = str(row[name_col]).strip() if pd.notna(row[name_col]) else None
+            if not name:
+                continue
+            
+            email = str(row.get('email', '')).strip() if pd.notna(row.get('email')) else None
+            department = str(row.get('department', '')).strip() if pd.notna(row.get('department')) else None
+            company = str(row.get('company', '')).strip() if pd.notna(row.get('company')) else None
+            meeting_count = int(row.get('meeting_count', 0)) if pd.notna(row.get('meeting_count')) else 0
+            
+            # Check if speaker already exists by email or name
+            existing = None
+            if email:
+                existing = run_query(f"SELECT speaker_id FROM SPEAKERS WHERE email = '{email}'")
+            if not existing:
+                name_escaped = name.replace("'", "''")
+                existing = run_query(f"SELECT speaker_id FROM SPEAKERS WHERE display_name = '{name_escaped}'")
+            
+            try:
+                if existing:
+                    # Update existing speaker
+                    speaker_id = existing[0][0]
+                    update_speaker(speaker_id, name, email, department, company, None, True, meeting_count)
+                    updated += 1
+                else:
+                    # Create new speaker
+                    create_speaker(name, email, department, company, None, meeting_count)
+                    imported += 1
+            except Exception as e:
+                errors.append(f"Zeile {idx+1}: {str(e)}")
+        
+        msg = f"✅ {imported} neu importiert, {updated} aktualisiert"
+        if errors:
+            msg += f"\n⚠️ {len(errors)} Fehler"
+        return True, msg
+    except Exception as e:
+        return False, f"CSV-Fehler: {str(e)}"
+
 # Sidebar - Speaker Management
 st.sidebar.header("👥 Sprecher")
 speakers = get_speakers()
@@ -385,21 +478,22 @@ if speakers:
         if len(filtered_speakers) > 20:
             st.sidebar.caption(f"Zeige erste 20 von {len(filtered_speakers)}")
         
-        # Speaker list with edit option
+        # Speaker list with edit option - show meeting count
         for s in display_speakers:
-            speaker_id, speaker_name, speaker_email = s[0], s[1], s[2]
+            speaker_id, speaker_name, speaker_email, meeting_count = s[0], s[1], s[2], s[3]
             
-            with st.sidebar.expander(f"📝 {speaker_name}"):
+            with st.sidebar.expander(f"📝 {speaker_name} ({meeting_count})"):
                 # Get full speaker details
                 details = get_speaker_details(speaker_id)
                 if details:
-                    _, name, email, dept, company, notes, is_internal = details
+                    _, name, email, dept, company, notes, is_internal, mtg_count = details
                     
                     with st.form(f"edit_speaker_{speaker_id}"):
                         edit_name = st.text_input("Name *", value=name or "")
                         edit_email = st.text_input("E-Mail", value=email or "")
                         edit_dept = st.text_input("Abteilung", value=dept or "")
                         edit_company = st.text_input("Firma", value=company or "")
+                        edit_meeting_count = st.number_input("Meetings", value=mtg_count or 0, min_value=0)
                         edit_notes = st.text_area("Notizen", value=notes or "")
                         edit_internal = st.checkbox("Intern", value=is_internal if is_internal is not None else True)
                         
@@ -418,7 +512,8 @@ if speakers:
                                     edit_dept if edit_dept else None,
                                     edit_company if edit_company else None,
                                     edit_notes if edit_notes else None,
-                                    edit_internal
+                                    edit_internal,
+                                    edit_meeting_count
                                 )
                                 if success:
                                     st.success("✅ Gespeichert!")
@@ -433,6 +528,26 @@ if speakers:
                                 st.experimental_rerun()
                             else:
                                 st.error(f"❌ {error}")
+
+st.sidebar.divider()
+
+# CSV Import
+st.sidebar.subheader("📤 CSV Import")
+uploaded_file = st.sidebar.file_uploader(
+    "Sprecher aus CSV importieren",
+    type=['csv'],
+    help="CSV mit Spalten: name, email, department, company, meeting_count"
+)
+
+if uploaded_file is not None:
+    if st.sidebar.button("📥 Importieren"):
+        content = uploaded_file.getvalue().decode('utf-8')
+        success, msg = import_speakers_from_csv(content)
+        if success:
+            st.sidebar.success(msg)
+            st.experimental_rerun()
+        else:
+            st.sidebar.error(msg)
 
 st.sidebar.divider()
 st.sidebar.subheader("➕ Neuen Sprecher anlegen")
@@ -594,14 +709,15 @@ else:
         st.subheader("🎯 Sprecher zuordnen")
         st.caption(f"Schwellenwert für Auto-Matching: {SIMILARITY_THRESHOLD:.0%}")
         
-        # Refresh speakers list and create searchable options
+        # Refresh speakers list and create searchable options (already sorted by meeting_count desc)
         speakers = get_speakers()
-        speaker_names = ["-- Nicht zugeordnet --"] + [s[1] for s in speakers]
+        # Format: "Name (count)" for display, sorted by meeting_count desc
+        speaker_names = ["-- Nicht zugeordnet --"] + [f"{s[1]} ({s[3]})" for s in speakers]
         speaker_ids = [None] + [s[0] for s in speakers]
         
-        # Create a mapping for quick lookup
-        speaker_name_to_id = {s[1]: s[0] for s in speakers}
-        speaker_id_to_name = {s[0]: s[1] for s in speakers}
+        # Create mappings for quick lookup
+        speaker_display_to_id = {f"{s[1]} ({s[3]})": s[0] for s in speakers}
+        speaker_id_to_display = {s[0]: f"{s[1]} ({s[3]})" for s in speakers}
         
         assignments_made = 0
         total_groups = len(groups)
@@ -653,24 +769,24 @@ else:
                         sample = (group[3] or "")[:400]
                         st.caption(f"*\"{sample}...\"*" if len(sample) >= 400 else f"*\"{sample}\"*")
                     
-                    # Searchable speaker selection
+                    # Searchable speaker selection (already sorted by meeting count)
                     col_select, col_button, col_delete = st.columns([3, 1, 1])
                     
                     with col_select:
-                        # Get current speaker name for default
-                        current_speaker_name = speaker_id_to_name.get(current_speaker, "-- Nicht zugeordnet --") if current_speaker else "-- Nicht zugeordnet --"
+                        # Get current speaker display name for default
+                        current_speaker_display = speaker_id_to_display.get(current_speaker, "-- Nicht zugeordnet --") if current_speaker else "-- Nicht zugeordnet --"
                         
                         # Use selectbox with search capability
-                        selected_speaker_name = st.selectbox(
+                        selected_speaker_display = st.selectbox(
                             f"Sprecher für {label}",
                             options=speaker_names,
-                            index=speaker_names.index(current_speaker_name) if current_speaker_name in speaker_names else 0,
+                            index=speaker_names.index(current_speaker_display) if current_speaker_display in speaker_names else 0,
                             key=f"speaker_{label}",
                             label_visibility="collapsed"
                         )
                         
-                        # Get the speaker ID from the selected name
-                        new_speaker_id = speaker_name_to_id.get(selected_speaker_name) if selected_speaker_name != "-- Nicht zugeordnet --" else None
+                        # Get the speaker ID from the selected display name
+                        new_speaker_id = speaker_display_to_id.get(selected_speaker_display) if selected_speaker_display != "-- Nicht zugeordnet --" else None
                     
                     with col_button:
                         if new_speaker_id and new_speaker_id != current_speaker:
@@ -678,7 +794,7 @@ else:
                                 with st.spinner(f"Verarbeite {label}... (Embedding-Extraktion kann dauern)"):
                                     # Use enhanced matching
                                     result = assign_speaker_with_matching(
-                                        call_id, label, new_speaker_id, selected_speaker_name, SIMILARITY_THRESHOLD
+                                        call_id, label, new_speaker_id, selected_speaker_display, SIMILARITY_THRESHOLD
                                     )
                                     
                                     if result['success']:
