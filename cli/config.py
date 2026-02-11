@@ -11,16 +11,17 @@ from pathlib import Path
 # ============================================================================
 # Snowflake Connection Settings
 # ============================================================================
-# Option 1: Use a named connection from ~/.snowflake/connections.toml
-# This is the preferred method - use the Azure account where CALL_TRANSCRIPTS_DB exists
-SNOWFLAKE_CONNECTION_NAME = os.environ.get("SNOWFLAKE_CONNECTION_NAME", "SFSEEUROPE-DWESSENDORF_AZURE1_WESTEU")
+# Option 1: Use a named connection from ~/.snowflake/connections.toml (recommended)
+# Set this to your connection name, or leave empty to use direct settings
+SNOWFLAKE_CONNECTION_NAME = os.environ.get("SNOWFLAKE_CONNECTION_NAME", "")
 
 # Option 2: Direct connection settings (used if SNOWFLAKE_CONNECTION_NAME is empty)
-SNOWFLAKE_ACCOUNT = os.environ.get("SNOWFLAKE_ACCOUNT", "")  # e.g., "xy12345.us-east-1"
+SNOWFLAKE_ACCOUNT = os.environ.get("SNOWFLAKE_ACCOUNT", "")  # e.g., "myaccount.us-east-1"
 SNOWFLAKE_USER = os.environ.get("SNOWFLAKE_USER", "")
-SNOWFLAKE_PASSWORD = os.environ.get("SNOWFLAKE_PASSWORD", "")  # Or use key-based auth
+SNOWFLAKE_PASSWORD = os.environ.get("SNOWFLAKE_PASSWORD", "")
 
-# Key-based authentication (optional, more secure)
+# Key-pair authentication (recommended for automation)
+# Generate key: openssl genrsa 2048 | openssl pkcs8 -topk8 -inform PEM -out rsa_key.p8 -nocrypt
 SNOWFLAKE_PRIVATE_KEY_PATH = os.environ.get(
     "SNOWFLAKE_PRIVATE_KEY_PATH", 
     str(Path.home() / ".snowflake" / "rsa_key.p8")
@@ -47,11 +48,11 @@ DEFAULT_OUTPUT_DIR = Path.home() / "Documents" / "CallTranscripts"
 # ============================================================================
 # Audio Format Settings
 # ============================================================================
-# Formats that don't need conversion
-NATIVE_FORMATS = {".mp3", ".wav", ".flac"}
+# Cortex AI_TRANSCRIBE supported formats (no conversion needed)
+NATIVE_FORMATS = {".mp3", ".wav", ".flac", ".ogg", ".webm"}
 
 # Formats that need conversion to MP3
-CONVERT_FORMATS = {".m4a", ".mp4", ".mov", ".aac", ".ogg", ".wma", ".webm", ".opus"}
+CONVERT_FORMATS = {".m4a", ".mp4", ".mov", ".aac", ".wma", ".opus"}
 
 # All supported formats
 SUPPORTED_FORMATS = NATIVE_FORMATS | CONVERT_FORMATS
@@ -64,20 +65,17 @@ AUDIO_CHANNELS = 2
 # ============================================================================
 # Speaker Identification Settings
 # ============================================================================
-# Minimum confidence threshold for auto-classification
-SPEAKER_CONFIDENCE_THRESHOLD = 0.75
+# Minimum confidence threshold for auto-classification (0.0 to 1.0)
+SPEAKER_CONFIDENCE_THRESHOLD = 0.6
 
 # Minimum segment duration (seconds) for embedding extraction
 MIN_DURATION_FOR_EMBEDDING = 5.0
 
 # ============================================================================
-# Polling Settings
+# Polling Settings (for --watch mode)
 # ============================================================================
-# Interval between status checks when using --watch
 POLL_INTERVAL_SECONDS = 10
-
-# Maximum wait time (attempts * interval = 3600 seconds = 1 hour)
-MAX_POLL_ATTEMPTS = 360
+MAX_POLL_ATTEMPTS = 360  # 360 * 10 = 3600 seconds = 1 hour
 
 # ============================================================================
 # Identifiers

@@ -1,6 +1,17 @@
+# Call Transcript CLI - Python Dependencies
+# Install with: pip install -r requirements.txt
+
+# CLI framework
 click>=8.0.0
 rich>=13.0.0
+
+# Snowflake connectivity
 snowflake-connector-python[pandas]>=3.0.0
-snowflake-snowpark-python>=1.10.0
+cryptography>=3.4.0
+toml>=0.10.0
+
+# Audio processing
 pydub>=0.25.0
+
+# Utilities
 python-dateutil>=2.8.0

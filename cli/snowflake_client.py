@@ -33,72 +33,80 @@ class CallStatus:
 
 
 def get_connection() -> snowflake.connector.SnowflakeConnection:
-    """Create Snowflake connection using keypair auth or connections.toml"""
+    """Create Snowflake connection using keypair auth, connections.toml, or direct settings."""
     import os
-    import toml
     from pathlib import Path
     
     # Disable OCSP certificate checking for S3 transfers
     os.environ['SF_OCSP_RESPONSE_CACHE_SERVER_ENABLED'] = 'false'
     
-    # Read connection from connections.toml
-    connections_file = Path.home() / ".snowflake" / "connections.toml"
-    if connections_file.exists():
-        connections = toml.load(connections_file)
-        
-        conn_name = config.SNOWFLAKE_CONNECTION_NAME
-        if conn_name and conn_name in connections:
-            conn_config = connections[conn_name]
-            
-            conn_params = {
-                'account': conn_config.get('account'),
-                'user': conn_config.get('user'),
-                'insecure_mode': True,
-                # Override with our config values for the call transcripts DB
-                'database': config.SNOWFLAKE_DATABASE,
-                'schema': config.SNOWFLAKE_SCHEMA,
-                'warehouse': config.SNOWFLAKE_WAREHOUSE,
-            }
-            
-            # Use role if specified in connection config
-            if 'role' in conn_config:
-                conn_params['role'] = conn_config['role']
-            
-            # Try keypair auth first (most reliable)
-            key_path = Path.home() / '.snowflake' / 'rsa_key.p8'
-            if key_path.exists():
-                try:
-                    from cryptography.hazmat.backends import default_backend
-                    from cryptography.hazmat.primitives import serialization
-                    
-                    with open(key_path, 'rb') as f:
-                        private_key = serialization.load_pem_private_key(
-                            f.read(),
-                            password=None,
-                            backend=default_backend()
-                        )
-                    conn_params['private_key'] = private_key
-                    conn = snowflake.connector.connect(**conn_params)
-                    return conn
-                except Exception as e:
-                    # Fall back to other auth methods
-                    pass
-            
-            # Handle different authenticators from toml
-            auth = conn_config.get('authenticator', 'snowflake')
-            if auth == 'PROGRAMMATIC_ACCESS_TOKEN':
-                conn_params['token'] = conn_config.get('token')
-                conn_params['authenticator'] = 'oauth'
-            elif auth == 'snowflake':
-                conn_params['password'] = conn_config.get('password', '')
-            
-            try:
-                conn = snowflake.connector.connect(**conn_params)
-                return conn
-            except Exception as e:
-                raise SnowflakeClientError(f"Failed to connect using {conn_name}: {e}")
+    conn_params = {
+        'database': config.SNOWFLAKE_DATABASE,
+        'schema': config.SNOWFLAKE_SCHEMA,
+        'warehouse': config.SNOWFLAKE_WAREHOUSE,
+        'insecure_mode': True,
+    }
     
-    raise SnowflakeClientError(f"Connection '{config.SNOWFLAKE_CONNECTION_NAME}' not found in connections.toml")
+    # Option 1: Use named connection from connections.toml
+    conn_name = config.SNOWFLAKE_CONNECTION_NAME
+    if conn_name:
+        try:
+            import toml
+            connections_file = Path.home() / ".snowflake" / "connections.toml"
+            if connections_file.exists():
+                connections = toml.load(connections_file)
+                if conn_name in connections:
+                    conn_config = connections[conn_name]
+                    conn_params['account'] = conn_config.get('account')
+                    conn_params['user'] = conn_config.get('user')
+                    if 'role' in conn_config:
+                        conn_params['role'] = conn_config['role']
+        except ImportError:
+            pass  # toml not installed, use direct settings
+    
+    # Option 2: Use direct settings from config/environment
+    if 'account' not in conn_params or not conn_params['account']:
+        if config.SNOWFLAKE_ACCOUNT:
+            conn_params['account'] = config.SNOWFLAKE_ACCOUNT
+            conn_params['user'] = config.SNOWFLAKE_USER
+        else:
+            raise SnowflakeClientError(
+                "No Snowflake connection configured. Set SNOWFLAKE_CONNECTION_NAME "
+                "or SNOWFLAKE_ACCOUNT/SNOWFLAKE_USER environment variables."
+            )
+    
+    # Authentication: Try keypair first, then password
+    key_path = Path(config.SNOWFLAKE_PRIVATE_KEY_PATH)
+    if key_path.exists():
+        try:
+            from cryptography.hazmat.backends import default_backend
+            from cryptography.hazmat.primitives import serialization
+            
+            with open(key_path, 'rb') as f:
+                private_key = serialization.load_pem_private_key(
+                    f.read(),
+                    password=None,
+                    backend=default_backend()
+                )
+            conn_params['private_key'] = private_key
+            return snowflake.connector.connect(**conn_params)
+        except Exception:
+            pass  # Fall back to password auth
+    
+    # Password authentication
+    if config.SNOWFLAKE_PASSWORD:
+        conn_params['password'] = config.SNOWFLAKE_PASSWORD
+    else:
+        raise SnowflakeClientError(
+            "No authentication method available. Provide either:\n"
+            "  - RSA key at ~/.snowflake/rsa_key.p8\n"
+            "  - SNOWFLAKE_PASSWORD environment variable"
+        )
+    
+    try:
+        return snowflake.connector.connect(**conn_params)
+    except Exception as e:
+        raise SnowflakeClientError(f"Failed to connect to Snowflake: {e}")
 
 
 def generate_call_id(title: str) -> str:
