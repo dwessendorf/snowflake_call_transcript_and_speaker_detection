@@ -33,55 +33,72 @@ class CallStatus:
 
 
 def get_connection() -> snowflake.connector.SnowflakeConnection:
-    """Create Snowflake connection using key-based auth or named connection"""
-    from pathlib import Path
-    from cryptography.hazmat.backends import default_backend
-    from cryptography.hazmat.primitives import serialization
+    """Create Snowflake connection using keypair auth or connections.toml"""
     import os
+    import toml
+    from pathlib import Path
     
     # Disable OCSP certificate checking for S3 transfers
     os.environ['SF_OCSP_RESPONSE_CACHE_SERVER_ENABLED'] = 'false'
     
-    # Try key-based auth first
-    key_path = Path(config.SNOWFLAKE_PRIVATE_KEY_PATH)
-    if key_path.exists():
-        try:
-            with open(key_path, "rb") as key_file:
-                p_key = serialization.load_pem_private_key(
-                    key_file.read(),
-                    password=None,
-                    backend=default_backend()
-                )
+    # Read connection from connections.toml
+    connections_file = Path.home() / ".snowflake" / "connections.toml"
+    if connections_file.exists():
+        connections = toml.load(connections_file)
+        
+        conn_name = config.SNOWFLAKE_CONNECTION_NAME
+        if conn_name and conn_name in connections:
+            conn_config = connections[conn_name]
             
-            pkb = p_key.private_bytes(
-                encoding=serialization.Encoding.DER,
-                format=serialization.PrivateFormat.PKCS8,
-                encryption_algorithm=serialization.NoEncryption()
-            )
+            conn_params = {
+                'account': conn_config.get('account'),
+                'user': conn_config.get('user'),
+                'insecure_mode': True,
+                # Override with our config values for the call transcripts DB
+                'database': config.SNOWFLAKE_DATABASE,
+                'schema': config.SNOWFLAKE_SCHEMA,
+                'warehouse': config.SNOWFLAKE_WAREHOUSE,
+            }
             
-            conn = snowflake.connector.connect(
-                account=config.SNOWFLAKE_ACCOUNT,
-                user=config.SNOWFLAKE_USER,
-                private_key=pkb,
-                database=config.SNOWFLAKE_DATABASE,
-                schema=config.SNOWFLAKE_SCHEMA,
-                warehouse=config.SNOWFLAKE_WAREHOUSE,
-                insecure_mode=True  # Disable OCSP for file transfers
-            )
-            return conn
-        except Exception as e:
-            pass  # Fall back to named connection
+            # Use role if specified in connection config
+            if 'role' in conn_config:
+                conn_params['role'] = conn_config['role']
+            
+            # Try keypair auth first (most reliable)
+            key_path = Path.home() / '.snowflake' / 'rsa_key.p8'
+            if key_path.exists():
+                try:
+                    from cryptography.hazmat.backends import default_backend
+                    from cryptography.hazmat.primitives import serialization
+                    
+                    with open(key_path, 'rb') as f:
+                        private_key = serialization.load_pem_private_key(
+                            f.read(),
+                            password=None,
+                            backend=default_backend()
+                        )
+                    conn_params['private_key'] = private_key
+                    conn = snowflake.connector.connect(**conn_params)
+                    return conn
+                except Exception as e:
+                    # Fall back to other auth methods
+                    pass
+            
+            # Handle different authenticators from toml
+            auth = conn_config.get('authenticator', 'snowflake')
+            if auth == 'PROGRAMMATIC_ACCESS_TOKEN':
+                conn_params['token'] = conn_config.get('token')
+                conn_params['authenticator'] = 'oauth'
+            elif auth == 'snowflake':
+                conn_params['password'] = conn_config.get('password', '')
+            
+            try:
+                conn = snowflake.connector.connect(**conn_params)
+                return conn
+            except Exception as e:
+                raise SnowflakeClientError(f"Failed to connect using {conn_name}: {e}")
     
-    # Fallback to named connection
-    try:
-        conn = snowflake.connector.connect(
-            connection_name=config.SNOWFLAKE_CONNECTION_NAME,
-            ocsp_response_cache_filename="/tmp/ocsp_cache",
-            insecure_mode=True
-        )
-        return conn
-    except Exception as e:
-        raise SnowflakeClientError(f"Failed to connect to Snowflake: {e}")
+    raise SnowflakeClientError(f"Connection '{config.SNOWFLAKE_CONNECTION_NAME}' not found in connections.toml")
 
 
 def generate_call_id(title: str) -> str:
@@ -230,16 +247,23 @@ def start_transcription(
     call_date: Optional[datetime] = None
 ) -> str:
     """
-    Start transcription for an uploaded audio file
+    Start transcription for an uploaded audio file using Cortex AI_TRANSCRIBE.
+    
+    The workflow:
+    1. Create a CALLS record with the stage path
+    2. Call TRANSCRIBE_CALL procedure which uses AI_TRANSCRIBE with speaker diarization
+    3. Contributions are automatically created from transcription segments
     
     Args:
-        stage_path: Path to file in stage
+        stage_path: Path to file in stage (e.g., @DB.SCHEMA.STAGE/file.mp3)
         call_title: Title for the call
         call_date: Date of call (default: today)
         
     Returns:
         Call ID
     """
+    import json
+    
     if call_date is None:
         call_date = datetime.now()
     
@@ -254,119 +278,41 @@ def start_transcription(
         cursor.execute(f"USE SCHEMA {config.SNOWFLAKE_SCHEMA}")
         cursor.execute(f"USE WAREHOUSE {config.SNOWFLAKE_WAREHOUSE}")
         
-        # Call transcription procedure
-        cursor.execute(f"CALL TRANSCRIBE_CALL('{stage_path}')")
+        # First, create the call record
+        insert_sql = f"""
+        INSERT INTO CALLS (
+            CALL_ID, TITLE, CALL_DATE, RECORDING_PATH, 
+            TRANSCRIPTION_STATUS, CLASSIFICATION_STATUS, CREATED_AT
+        ) VALUES (
+            '{call_id}', 
+            '{call_title.replace("'", "''")}', 
+            '{call_date.strftime("%Y-%m-%d")}',
+            '{stage_path}',
+            'pending',
+            'pending',
+            CURRENT_TIMESTAMP
+        )
+        """
+        cursor.execute(insert_sql)
+        
+        # Commit the insert so the procedure can see it
+        # (procedure runs in separate transaction context)
+        conn.commit()
+        
+        # Call the TRANSCRIBE_CALL procedure which uses Cortex AI_TRANSCRIBE
+        cursor.execute(f"CALL TRANSCRIBE_CALL('{call_id}')")
         result = cursor.fetchone()
         
         if result:
-            import json
             try:
                 data = json.loads(result[0]) if isinstance(result[0], str) else result[0]
                 if data.get("status") == "success":
-                    # Get transcription details
-                    transcription = data.get("transcription", "")
-                    num_speakers = data.get("num_speakers", 0)
-                    duration_mins = data.get("estimated_duration_minutes", 0)
-                    
-                    # Save to CALLS table
-                    insert_sql = f"""
-                    INSERT INTO CALLS (
-                        CALL_ID, TITLE, CALL_DATE, RECORDING_PATH, 
-                        TRANSCRIPTION_STATUS, CLASSIFICATION_STATUS,
-                        TOTAL_SPEAKERS, DURATION_MINUTES, CREATED_AT
-                    ) VALUES (
-                        '{call_id}', 
-                        '{call_title.replace("'", "''")}', 
-                        '{call_date.strftime("%Y-%m-%d")}',
-                        '{stage_path}',
-                        'completed',
-                        'pending',
-                        {num_speakers},
-                        {int(duration_mins)},
-                        CURRENT_TIMESTAMP
-                    )
-                    """
-                    cursor.execute(insert_sql)
-                    
-                    # Save transcription to TRANSCRIPTIONS stage
-                    transcription_path = f"{config.STAGE_TRANSCRIPTIONS}/{call_id}_transcript.json"
-                    
-                    # Parse and save contributions - merge consecutive segments from same speaker
-                    if transcription:
-                        trans_data = json.loads(transcription) if isinstance(transcription, str) else transcription
-                        segments = trans_data.get("segments", [])
-                        
-                        # Merge consecutive segments from the same speaker
-                        merged_segments = []
-                        current_segment = None
-                        
-                        for seg in segments:
-                            speaker = seg.get("speaker_label", "UNKNOWN")
-                            
-                            if current_segment is None:
-                                # Start a new segment
-                                current_segment = {
-                                    "speaker_label": speaker,
-                                    "start": seg.get("start", 0),
-                                    "end": seg.get("end", 0),
-                                    "text": seg.get("text", "")
-                                }
-                            elif speaker == current_segment["speaker_label"]:
-                                # Same speaker - merge with current segment
-                                current_segment["end"] = seg.get("end", current_segment["end"])
-                                current_segment["text"] += " " + seg.get("text", "")
-                            else:
-                                # Different speaker - save current and start new
-                                merged_segments.append(current_segment)
-                                current_segment = {
-                                    "speaker_label": speaker,
-                                    "start": seg.get("start", 0),
-                                    "end": seg.get("end", 0),
-                                    "text": seg.get("text", "")
-                                }
-                        
-                        # Don't forget the last segment
-                        if current_segment:
-                            merged_segments.append(current_segment)
-                        
-                        # Insert merged segments as contributions
-                        for idx, seg in enumerate(merged_segments):
-                            contrib_id = f"{call_id}_{idx:04d}"
-                            start_time = seg.get("start", 0)
-                            end_time = seg.get("end", 0)
-                            duration = end_time - start_time if end_time > start_time else 0
-                            text = seg.get("text", "").strip()
-                            word_count = len(text.split())
-                            
-                            insert_contrib = f"""
-                            INSERT INTO CALL_CONTRIBUTIONS (
-                                CONTRIBUTION_ID, CALL_ID, SEGMENT_NUMBER,
-                                DIARIZATION_LABEL, TEXT_CONTENT,
-                                START_TIME_SECONDS, END_TIME_SECONDS, 
-                                DURATION_SECONDS, WORD_COUNT,
-                                CLASSIFICATION_STATUS, CREATED_AT
-                            ) VALUES (
-                                '{contrib_id}',
-                                '{call_id}',
-                                {idx},
-                                '{seg.get("speaker_label", "UNKNOWN")}',
-                                '{text.replace("'", "''")}',
-                                {start_time},
-                                {end_time},
-                                {duration},
-                                {word_count},
-                                'pending',
-                                CURRENT_TIMESTAMP
-                            )
-                            """
-                            cursor.execute(insert_contrib)
-                    
                     return call_id
-                else:
+                elif data.get("status") == "error":
                     raise SnowflakeClientError(f"Transcription failed: {data.get('message')}")
             except json.JSONDecodeError:
-                # Result might be the call ID directly
-                return str(result[0]) if result[0] else call_id
+                # Result might be something else, continue
+                pass
         
         return call_id
         

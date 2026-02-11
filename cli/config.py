@@ -11,8 +11,9 @@ from pathlib import Path
 # ============================================================================
 # Snowflake Connection Settings
 # ============================================================================
-# Option 1: Use a named connection from ~/.snowsql/config
-SNOWFLAKE_CONNECTION_NAME = os.environ.get("SNOWFLAKE_CONNECTION_NAME", "")
+# Option 1: Use a named connection from ~/.snowflake/connections.toml
+# This is the preferred method - use the Azure account where CALL_TRANSCRIPTS_DB exists
+SNOWFLAKE_CONNECTION_NAME = os.environ.get("SNOWFLAKE_CONNECTION_NAME", "SFSEEUROPE-DWESSENDORF_AZURE1_WESTEU")
 
 # Option 2: Direct connection settings (used if SNOWFLAKE_CONNECTION_NAME is empty)
 SNOWFLAKE_ACCOUNT = os.environ.get("SNOWFLAKE_ACCOUNT", "")  # e.g., "xy12345.us-east-1"
