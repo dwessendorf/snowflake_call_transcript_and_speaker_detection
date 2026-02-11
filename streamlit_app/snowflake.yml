@@ -1,0 +1,7 @@
+definition_version: 1.1
+streamlit:
+  name: speaker_classification_app
+  title: Speaker Classification
+  query_warehouse: STREAMLIT_APP_WH
+  main_file: app.py
+  stage: CALL_TRANSCRIPTS_DB.TRANSCRIPTS.STREAMLIT_APPS

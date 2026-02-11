@@ -27,6 +27,13 @@ except:
 # Configuration
 SIMILARITY_THRESHOLD = 0.75  # Threshold for auto-matching
 
+def clear_all_caches():
+    """Clear all cached data - compatible with older Streamlit versions"""
+    try:
+        st.cache_data.clear()
+    except:
+        pass
+
 # =============================================================================
 # CACHED QUERY FUNCTIONS - Use caching to avoid repeated queries
 # =============================================================================
@@ -64,19 +71,22 @@ def get_calls_cached(only_incomplete=True):
 @st.cache_data(ttl=30)
 def get_diarization_groups_cached(call_id):
     """Get contributions grouped by diarization label - CACHED"""
-    results = session.sql(f"""
-        SELECT 
-            diarization_label,
-            COUNT(*) as segment_count,
-            SUM(end_time_seconds - start_time_seconds) as total_duration,
-            LISTAGG(SUBSTR(text_content, 1, 100), ' | ') WITHIN GROUP (ORDER BY segment_number) as sample_text,
-            MIN(identified_speaker_id) as current_speaker_id
-        FROM CALL_CONTRIBUTIONS
-        WHERE call_id = '{call_id}'
-        GROUP BY diarization_label
-        ORDER BY MIN(segment_number)
-    """).collect()
-    return [(r[0], r[1], r[2], r[3], r[4]) for r in results]
+    try:
+        results = session.sql(f"""
+            SELECT 
+                diarization_label,
+                COUNT(*) as segment_count,
+                SUM(end_time_seconds - start_time_seconds) as total_duration,
+                MIN(identified_speaker_id) as current_speaker_id
+            FROM CALL_CONTRIBUTIONS
+            WHERE call_id = '{call_id}'
+            GROUP BY diarization_label
+            ORDER BY MIN(segment_number)
+        """).collect()
+        return [(r[0], r[1], r[2], None, r[3]) for r in results]
+    except Exception as e:
+        st.error(f"Error loading groups: {e}")
+        return []
 
 @st.cache_data(ttl=60)
 def get_embedding_counts_cached():
@@ -121,7 +131,7 @@ def run_query(sql):
     return session.sql(sql).collect()
 
 def get_segments_for_label(call_id, diarization_label):
-    """Get individual segments for a diarization label"""
+    """Get individual segments for a diarization label, ordered by time"""
     results = session.sql(f"""
         SELECT 
             contribution_id,
@@ -132,7 +142,7 @@ def get_segments_for_label(call_id, diarization_label):
         FROM CALL_CONTRIBUTIONS
         WHERE call_id = '{call_id}'
         AND diarization_label = '{diarization_label}'
-        ORDER BY segment_number
+        ORDER BY start_time_seconds
     """).collect()
     return [(r[0], r[1], r[2], r[3], r[4]) for r in results]
 
@@ -151,12 +161,16 @@ def increment_speaker_meeting_count(speaker_id):
 
 def assign_speaker_fast(call_id, diarization_label, speaker_id):
     """
-    Fast speaker assignment - just updates the database.
-    Embeddings are pre-computed, matching happens in background task.
+    Fast speaker assignment - updates database and triggers background matching.
+    After manual assignment:
+    1. Updates the contribution
+    2. Creates/updates voiceprint for speaker (if better sample available)
+    3. Background task will match against other meetings
     """
     results = {
         'success': False,
         'segments_updated': 0,
+        'voiceprint_updated': False,
         'errors': []
     }
     
@@ -179,7 +193,7 @@ def assign_speaker_fast(call_id, diarization_label, speaker_id):
         total_count = count_result[0][0] if count_result else 0
         
         if total_count == 0:
-            results['errors'].append('Keine Beiträge gefunden')
+            results['errors'].append('No contributions found')
             return results
         
         # Fast update - just assign the speaker
@@ -200,7 +214,7 @@ def assign_speaker_fast(call_id, diarization_label, speaker_id):
             AND diarization_label = '{diarization_label}'
         """).collect()
         
-        # Remove from pre-computed embeddings (no longer needed)
+        # Remove from pre-computed embeddings (no longer needed for this speaker)
         session.sql(f"""
             DELETE FROM CONTRIBUTION_EMBEDDINGS
             WHERE call_id = '{call_id}'
@@ -214,9 +228,47 @@ def assign_speaker_fast(call_id, diarization_label, speaker_id):
         results['success'] = True
         results['segments_updated'] = total_count
         
+        # Try to create/update voiceprint for this speaker (async, don't block UI)
+        try:
+            # Check if speaker has a voiceprint
+            vp_exists = run_query(f"""
+                SELECT sample_duration_seconds FROM SPEAKER_VOICEPRINTS 
+                WHERE speaker_id = '{speaker_id}'
+            """)
+            
+            # Get best contribution from this assignment for voiceprint
+            best_contrib = run_query(f"""
+                SELECT cc.contribution_id, cc.start_time_seconds, cc.end_time_seconds,
+                       cc.duration_seconds, c.recording_path
+                FROM CALL_CONTRIBUTIONS cc
+                JOIN CALLS c ON cc.call_id = c.call_id
+                WHERE cc.call_id = '{call_id}'
+                AND cc.diarization_label = '{diarization_label}'
+                AND cc.duration_seconds >= 10
+                ORDER BY cc.duration_seconds DESC
+                LIMIT 1
+            """)
+            
+            if best_contrib:
+                new_duration = best_contrib[0][3]
+                current_duration = vp_exists[0][0] if vp_exists else 0
+                
+                # Create or update voiceprint if we have better sample
+                if not vp_exists or new_duration > current_duration:
+                    # Call procedure to create voiceprint (runs async in background)
+                    session.sql(f"""
+                        CALL CREATE_SPEAKER_VOICEPRINT_FROM_CONTRIBUTION(
+                            '{speaker_id}', '{call_id}', '{diarization_label}'
+                        )
+                    """).collect()
+                    results['voiceprint_updated'] = True
+        except Exception as vp_error:
+            # Don't fail the assignment if voiceprint creation fails
+            pass
+        
         # Clear caches
-        get_diarization_groups_cached.clear()
-        get_speakers_cached.clear()
+        clear_all_caches()
+        clear_all_caches()
         
         return results
         
@@ -235,7 +287,7 @@ def delete_contributions(call_id, diarization_label):
         count = count_result[0][0] if count_result else 0
         
         if count == 0:
-            return False, "Keine Beiträge gefunden"
+            return False, "No contributions found"
         
         session.sql(f"""
             DELETE FROM CLASSIFICATION_QUEUE 
@@ -249,8 +301,8 @@ def delete_contributions(call_id, diarization_label):
             AND diarization_label = '{diarization_label}'
         """).collect()
         
-        get_diarization_groups_cached.clear()
-        return True, f"{count} Beiträge gelöscht"
+        clear_all_caches()
+        return True, f"{count} contributions deleted"
     except Exception as e:
         return False, str(e)
 
@@ -269,7 +321,7 @@ def create_speaker(name, email=None, department=None, company=None, notes=None, 
             INSERT INTO SPEAKERS (speaker_id, display_name, email, department, company, notes, is_internal, meeting_count, created_at, updated_at, created_by)
             VALUES ('{speaker_id}', '{name_escaped}', {email_val}, {dept_val}, {company_val}, {notes_val}, TRUE, {meeting_count}, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_USER())
         """).collect()
-        get_speakers_cached.clear()
+        clear_all_caches()
         return speaker_id
     except Exception as e:
         st.error(f"Error creating speaker: {e}")
@@ -311,11 +363,35 @@ def update_speaker(speaker_id, name, email=None, department=None, company=None, 
                 {meeting_count_sql}
             WHERE speaker_id = '{speaker_id}'
         """).collect()
-        get_speakers_cached.clear()
+        clear_all_caches()
         return True
     except Exception as e:
         st.error(f"Error updating speaker: {e}")
         return False
+
+def get_speaker_details(speaker_id):
+    """Get full details of a speaker"""
+    try:
+        results = run_query(f"""
+            SELECT speaker_id, display_name, email, department, company, notes, is_internal, meeting_count
+            FROM SPEAKERS
+            WHERE speaker_id = '{speaker_id}'
+        """)
+        if results:
+            r = results[0]
+            return {
+                'speaker_id': r[0],
+                'display_name': r[1],
+                'email': r[2],
+                'department': r[3],
+                'company': r[4],
+                'notes': r[5],
+                'is_internal': r[6],
+                'meeting_count': r[7]
+            }
+        return None
+    except:
+        return None
 
 def delete_speaker(speaker_id):
     """Delete a speaker (only if not used)"""
@@ -327,32 +403,44 @@ def delete_speaker(speaker_id):
         count = count_result[0][0] if count_result else 0
         
         if count > 0:
-            return False, f"Sprecher wird in {count} Beiträgen verwendet"
+            return False, f"Speaker is used in {count} contributions"
         
         session.sql(f"DELETE FROM SPEAKERS WHERE speaker_id = '{speaker_id}'").collect()
-        get_speakers_cached.clear()
+        clear_all_caches()
         return True, None
     except Exception as e:
         return False, str(e)
 
 def update_call_status(call_id):
-    """Update call status based on classification progress"""
+    """Update call status based on classification progress.
+    
+    A call is 'completed' only when ALL diarization labels have an assigned speaker.
+    This prevents marking as complete when some labels are deleted but others remain unassigned.
+    """
+    # Check if all diarization labels have a speaker assigned
     results = run_query(f"""
         SELECT 
-            COUNT(*) as total,
-            SUM(CASE WHEN classification_status IN ('classified', 'auto_classified') THEN 1 ELSE 0 END) as classified
+            COUNT(DISTINCT diarization_label) as total_labels,
+            COUNT(DISTINCT CASE WHEN identified_speaker_id IS NOT NULL THEN diarization_label END) as assigned_labels
         FROM CALL_CONTRIBUTIONS
         WHERE call_id = '{call_id}'
     """)
     
     if results:
-        total, classified = results[0][0], results[0][1]
-        if total == classified and total > 0:
+        total_labels, assigned_labels = results[0][0], results[0][1]
+        if total_labels > 0 and total_labels == assigned_labels:
             session.sql(f"""
                 UPDATE CALLS SET classification_status = 'completed'
                 WHERE call_id = '{call_id}'
             """).collect()
-            get_calls_cached.clear()
+            clear_all_caches()
+        else:
+            # Reset to pending if not all labels are assigned
+            session.sql(f"""
+                UPDATE CALLS SET classification_status = 'pending'
+                WHERE call_id = '{call_id}' AND classification_status = 'completed'
+            """).collect()
+            clear_all_caches()
 
 def filter_speakers(speakers, search_term):
     """Filter speakers by search term"""
@@ -368,7 +456,7 @@ def import_speakers_from_csv(csv_content):
         df.columns = df.columns.str.lower().str.strip()
         
         if 'name' not in df.columns and 'display_name' not in df.columns:
-            return False, "CSV muss eine 'name' oder 'display_name' Spalte haben"
+            return False, "CSV must have a 'name' or 'display_name' column"
         
         name_col = 'name' if 'name' in df.columns else 'display_name'
         imported = 0
@@ -402,171 +490,95 @@ def import_speakers_from_csv(csv_content):
             except:
                 pass
         
-        get_speakers_cached.clear()
-        return True, f"✅ {imported} neu importiert, {updated} aktualisiert"
+        clear_all_caches()
+        return True, f"{imported} imported, {updated} updated"
     except Exception as e:
-        return False, f"CSV-Fehler: {str(e)}"
+        return False, f"CSV error: {str(e)}"
+
+def format_time(seconds):
+    """Format seconds as MM:SS"""
+    if seconds is None:
+        return "0:00"
+    mins = int(seconds // 60)
+    secs = int(seconds % 60)
+    return f"{mins}:{secs:02d}"
 
 # =============================================================================
-# UI - TITLE
+# UI - TITLE AND SETTINGS BUTTON
 # =============================================================================
 
-st.title("🎤 Speaker Classification")
+# Title row with Settings button
+col_title, col_settings = st.columns([6, 1])
+with col_title:
+    st.title("Speaker Classification")
+with col_settings:
+    st.write("")  # Spacer
+    if st.button("Settings", key="settings_btn"):
+        st.session_state['show_settings_panel'] = not st.session_state.get('show_settings_panel', False)
 
 # =============================================================================
-# SIDEBAR - Speaker Management
+# SETTINGS PANEL (collapsible, replaces sidebar)
 # =============================================================================
 
-st.sidebar.header("👥 Sprecher")
-
-# Load speakers once (cached)
-speakers = get_speakers_cached()
-
-if speakers:
-    st.sidebar.write(f"**{len(speakers)} Sprecher registriert**")
-    
-    speaker_search = st.sidebar.text_input(
-        "🔍 Sprecher suchen",
-        placeholder="Name oder E-Mail...",
-        key="sidebar_speaker_search"
-    )
-    
-    filtered_speakers = filter_speakers(speakers, speaker_search)
-    
-    if speaker_search and not filtered_speakers:
-        st.sidebar.info(f"Keine Sprecher gefunden für '{speaker_search}'")
-    elif filtered_speakers:
-        if speaker_search:
-            st.sidebar.caption(f"{len(filtered_speakers)} Treffer")
+if st.session_state.get('show_settings_panel', False):
+    with st.container():
+        st.markdown("---")
+        settings_col1, settings_col2, settings_col3 = st.columns(3)
         
-        # Only show first 10 for performance
-        display_speakers = filtered_speakers[:10]
-        if len(filtered_speakers) > 10:
-            st.sidebar.caption(f"Zeige erste 10 von {len(filtered_speakers)}")
-        
-        for s in display_speakers:
-            speaker_id, speaker_name, speaker_email, meeting_count = s[0], s[1], s[2], s[3]
-            
-            with st.sidebar.expander(f"📝 {speaker_name} ({meeting_count})"):
-                details = get_speaker_details(speaker_id)
-                if details:
-                    _, name, email, dept, company, notes, is_internal, mtg_count = details
-                    
-                    with st.form(f"edit_speaker_{speaker_id}"):
-                        edit_name = st.text_input("Name *", value=name or "")
-                        edit_email = st.text_input("E-Mail", value=email or "")
-                        edit_dept = st.text_input("Abteilung", value=dept or "")
-                        edit_company = st.text_input("Firma", value=company or "")
-                        edit_meeting_count = st.number_input("Meetings", value=mtg_count or 0, min_value=0)
-                        edit_notes = st.text_area("Notizen", value=notes or "")
-                        edit_internal = st.checkbox("Intern", value=is_internal if is_internal is not None else True)
-                        
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            save_btn = st.form_submit_button("💾 Speichern")
-                        with col2:
-                            delete_btn = st.form_submit_button("🗑️ Löschen")
-                        
-                        if save_btn:
-                            if edit_name:
-                                success = update_speaker(
-                                    speaker_id, edit_name,
-                                    edit_email if edit_email else None,
-                                    edit_dept if edit_dept else None,
-                                    edit_company if edit_company else None,
-                                    edit_notes if edit_notes else None,
-                                    edit_internal, edit_meeting_count
-                                )
-                                if success:
-                                    st.success("✅ Gespeichert!")
-                                    st.experimental_rerun()
-                            else:
-                                st.error("Name ist erforderlich")
-                        
-                        if delete_btn:
-                            success, error = delete_speaker(speaker_id)
-                            if success:
-                                st.success("✅ Gelöscht!")
-                                st.experimental_rerun()
-                            else:
-                                st.error(f"❌ {error}")
-
-st.sidebar.divider()
-
-# CSV Import
-st.sidebar.subheader("📤 CSV Import")
-with st.sidebar.expander("CSV einfügen"):
-    st.caption("Spalten: name, email, department, company, meeting_count")
-    csv_text = st.text_area(
-        "CSV Inhalt",
-        height=150,
-        placeholder="name,email,meeting_count\nMax Mustermann,max@example.com,5\n...",
-        key="csv_import_text"
-    )
-    if st.button("📥 Importieren", key="import_csv_btn"):
-        if csv_text and csv_text.strip():
-            success, msg = import_speakers_from_csv(csv_text)
-            if success:
-                st.success(msg)
-                st.experimental_rerun()
+        with settings_col1:
+            st.subheader("Embeddings Status")
+            stored_embeddings, pending_embeddings = get_embedding_counts_cached()
+            st.metric("Stored / Total", f"{stored_embeddings} / {stored_embeddings + pending_embeddings}")
+            if pending_embeddings > 0:
+                st.caption(f"{pending_embeddings} being computed...")
             else:
-                st.error(msg)
-        else:
-            st.warning("Bitte CSV-Daten einfügen")
-
-st.sidebar.divider()
-st.sidebar.subheader("➕ Neuen Sprecher anlegen")
-
-with st.sidebar.form("new_speaker"):
-    new_name = st.text_input("Name *")
-    new_email = st.text_input("E-Mail")
-    new_dept = st.text_input("Abteilung")
-    new_company = st.text_input("Firma")
-    new_notes = st.text_area("Notizen")
-    
-    submitted = st.form_submit_button("Sprecher anlegen")
-    if submitted:
-        if new_name:
-            speaker_id = create_speaker(
-                new_name, 
-                new_email if new_email else None,
-                new_dept if new_dept else None,
-                new_company if new_company else None,
-                new_notes if new_notes else None
+                st.caption("All embeddings computed")
+        
+        with settings_col2:
+            st.subheader("Matching Settings")
+            threshold = st.slider(
+                "Threshold",
+                min_value=0.5,
+                max_value=0.95,
+                value=st.session_state.get('similarity_threshold', SIMILARITY_THRESHOLD),
+                step=0.05,
+                help="Segments with higher similarity will be auto-assigned"
             )
-            if speaker_id:
-                st.sidebar.success(f"✅ {new_name} angelegt!")
-                st.experimental_rerun()
-        else:
-            st.sidebar.error("Name ist erforderlich")
+            st.session_state['similarity_threshold'] = threshold
+        
+        with settings_col3:
+            st.subheader("Import Speakers")
+            with st.expander("CSV Import"):
+                st.caption("Columns: name, email, department, company, meeting_count")
+                csv_text = st.text_area(
+                    "CSV Content",
+                    height=100,
+                    placeholder="name,email,meeting_count\nJohn Doe,john@example.com,5",
+                    key="csv_import_text_panel",
+                    label_visibility="collapsed"
+                )
+                if st.button("Import CSV", key="import_csv_panel", type="primary"):
+                    if csv_text and csv_text.strip():
+                        success, msg = import_speakers_from_csv(csv_text)
+                        if success:
+                            st.success(msg)
+                            st.experimental_rerun()
+                        else:
+                            st.error(msg)
+                    else:
+                        st.warning("Please paste CSV data")
+        
+        st.markdown("---")
 
-# Settings
-st.sidebar.divider()
-st.sidebar.subheader("⚙️ Einstellungen")
-threshold = st.sidebar.slider(
-    "Matching-Schwellenwert",
-    min_value=0.5,
-    max_value=0.95,
-    value=SIMILARITY_THRESHOLD,
-    step=0.05,
-    help="Segmente mit höherer Ähnlichkeit werden automatisch zugeordnet"
-)
-SIMILARITY_THRESHOLD = threshold
-
-# Background Matching Info
-st.sidebar.divider()
-st.sidebar.subheader("🔄 Auto-Matching")
-stored_embeddings, pending_embeddings = get_embedding_counts_cached()
-st.sidebar.metric("Gespeicherte Embeddings", stored_embeddings)
-st.sidebar.metric("Wartende Beiträge", pending_embeddings)
-if pending_embeddings > 0:
-    st.sidebar.caption("⏳ Embeddings werden automatisch berechnet (alle 5 Min)")
-else:
-    st.sidebar.caption("✅ Alle Embeddings berechnet")
+# Get threshold from session state
+SIMILARITY_THRESHOLD = st.session_state.get('similarity_threshold', SIMILARITY_THRESHOLD)
 
 # =============================================================================
 # MAIN CONTENT
 # =============================================================================
+
+# Load speakers once (cached)
+speakers = get_speakers_cached()
 
 # Initialize filter state
 if 'show_only_incomplete' not in st.session_state:
@@ -575,25 +587,25 @@ if 'show_only_incomplete' not in st.session_state:
 # Filter toggle
 filter_col1, filter_col2 = st.columns([3, 1])
 with filter_col1:
-    st.subheader("📋 Calls")
+    st.subheader("Calls")
 with filter_col2:
     show_filter = st.selectbox(
         "Filter",
-        options=["Nur unvollständige", "Alle Calls"],
+        options=["Incomplete only", "All Calls"],
         index=0 if st.session_state.show_only_incomplete else 1,
         key="call_filter",
         label_visibility="collapsed"
     )
-    st.session_state.show_only_incomplete = (show_filter == "Nur unvollständige")
+    st.session_state.show_only_incomplete = (show_filter == "Incomplete only")
 
 calls = get_calls_cached(only_incomplete=st.session_state.show_only_incomplete)
 
 if not calls:
     if st.session_state.show_only_incomplete:
-        st.success("🎉 Alle Calls sind vollständig klassifiziert!")
-        st.info("Wählen Sie 'Alle Calls' um abgeschlossene Calls anzuzeigen.")
+        st.success("All calls are fully classified!")
+        st.info("Select 'All Calls' to view completed calls.")
     else:
-        st.info("Keine Calls gefunden. Laden Sie ein Call über die CLI hoch.")
+        st.info("No calls found. Upload a call via the CLI.")
 else:
     # Initialize session state for call selection
     if 'selected_call_id' not in st.session_state:
@@ -612,7 +624,7 @@ else:
     # Call selector
     call_options = [f"{m[1]} ({m[3]})" for m in calls]
     selected_idx = st.selectbox(
-        "Call auswählen", 
+        "Select Call", 
         range(len(calls)), 
         index=current_idx,
         format_func=lambda i: call_options[i],
@@ -625,9 +637,9 @@ else:
     
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("Beiträge", selected_call[4])
+        st.metric("Contributions", selected_call[4])
     with col2:
-        st.metric("Erkannte Stimmen", selected_call[5])
+        st.metric("Detected Voices", selected_call[5])
     with col3:
         st.metric("Status", selected_call[3])
     
@@ -637,54 +649,49 @@ else:
     groups = get_diarization_groups_cached(call_id)
     
     if not groups:
-        st.warning("Keine Beiträge für dieses Call gefunden.")
+        st.warning("No contributions found for this call.")
     else:
-        # Audio player
+        # Audio player at top (separate component)
         audio_url = get_audio_url_cached(call_id)
         if audio_url:
-            buttons_html = ""
-            for group in groups:
-                label = group[0]
-                segments = get_segments_for_label(call_id, label)
-                if segments:
-                    first_start_sec = segments[0][2] or 0
-                    start_fmt = f"{int(first_start_sec//60)}:{int(first_start_sec%60):02d}"
-                    buttons_html += f"""
-                    <button onclick="seekTo({first_start_sec});" 
-                            style="background: #4CAF50; color: white; border: none; padding: 5px 10px; border-radius: 4px; cursor: pointer; font-size: 11px; margin: 2px;">
-                        {label} ({start_fmt})
-                    </button>
-                    """
-            
             audio_html = f"""
-            <div style="background: #1e1e1e; padding: 15px; border-radius: 10px;">
-                <audio id="call_audio" controls style="width: 100%;" preload="metadata">
+            <div style="background:#1e1e1e;padding:15px;border-radius:10px;">
+                <audio id="main_audio_{call_id}" controls style="width:100%;" preload="metadata">
                     <source src="{audio_url}" type="audio/mpeg">
                 </audio>
-                <div style="margin-top: 10px;">
-                    <span style="color: #888; font-size: 12px;">Springe zu: </span>
-                    {buttons_html}
-                </div>
             </div>
             <script>
-                var audioElement = document.getElementById('call_audio');
-                function seekTo(seconds) {{
-                    audioElement.currentTime = seconds;
-                    audioElement.play();
+                // Clear any stale seek data when call changes
+                var currentCallId = '{call_id}';
+                var storedCallId = localStorage.getItem('audioCallId') || '';
+                if (storedCallId !== currentCallId) {{
+                    localStorage.setItem('audioCallId', currentCallId);
+                    localStorage.setItem('audioSeekTime', '0');
+                    localStorage.setItem('audioSeekSeconds', '0');
                 }}
-                window.parent.seekAudioTo = function(seconds) {{
-                    audioElement.currentTime = seconds;
-                    audioElement.play();
-                }};
+                
+                // Listen for seek commands from other iframes via localStorage
+                var lastSeekTime = localStorage.getItem('audioSeekTime') || '0';
+                setInterval(function() {{
+                    var currentSeekTime = localStorage.getItem('audioSeekTime') || '0';
+                    if (currentSeekTime !== lastSeekTime) {{
+                        lastSeekTime = currentSeekTime;
+                        var seconds = parseFloat(localStorage.getItem('audioSeekSeconds') || '0');
+                        var audio = document.getElementById('main_audio_{call_id}');
+                        if (audio) {{
+                            audio.currentTime = seconds;
+                            audio.play();
+                        }}
+                    }}
+                }}, 100);
             </script>
             """
-            components.html(audio_html, height=130)
+            components.html(audio_html, height=80)
         
-        st.subheader("🎯 Sprecher zuordnen")
-        st.caption(f"Schwellenwert für Auto-Matching: {SIMILARITY_THRESHOLD:.0%}")
+        st.subheader("Assign Speakers")
         
         # Speaker options (use cached speakers)
-        speaker_names = ["-- Nicht zugeordnet --"] + [f"{s[1]} ({s[3]})" for s in speakers]
+        speaker_names = ["-- Not assigned --"] + [f"{s[1]} ({s[3]})" for s in speakers]
         speaker_display_to_id = {f"{s[1]} ({s[3]})": s[0] for s in speakers}
         speaker_id_to_display = {s[0]: f"{s[1]} ({s[3]})" for s in speakers}
         
@@ -697,66 +704,209 @@ else:
             duration = group[2] or 0
             current_speaker = group[4]
             
-            segments = get_segments_for_label(call_id, label) if audio_url else []
-            
             is_assigned = current_speaker is not None
             if is_assigned:
                 assignments_made += 1
             
+            # Get segments for this label - always fetch
+            segments = get_segments_for_label(call_id, label)
+            
             with st.container():
-                col1, col2 = st.columns([1, 3])
+                # Header row with label and stats - show actual loaded count
+                actual_count = len(segments) if segments else 0
+                # Debug: show time range
+                if segments:
+                    first_time = format_time(segments[0][2] or 0)
+                    last_time = format_time(segments[-1][2] or 0)
+                    time_range = f"({first_time} - {last_time})"
+                else:
+                    time_range = ""
+                if is_assigned:
+                    st.markdown(f"**{label}** :green[assigned] - {actual_count} segments {time_range} | {duration:.0f}s total")
+                else:
+                    st.markdown(f"**{label}** :orange[unassigned] - {actual_count} segments {time_range} | {duration:.0f}s total")
                 
-                with col1:
-                    if is_assigned:
-                        st.success(f"**{label}** ✓")
+                # Clickable segment links - first 20 words of ALL segments (scrollable)
+                if segments and audio_url:
+                    links_html = ""
+                    for i, seg in enumerate(segments):  # Show ALL segments
+                        start_sec = seg[2] or 0
+                        time_str = format_time(start_sec)
+                        text = seg[4] or ""
+                        # Get first 20 words
+                        words = text.split()[:20]
+                        preview = " ".join(words)
+                        if len(text.split()) > 20:
+                            preview += "..."
+                        # Escape for HTML
+                        preview = preview.replace('&', '&amp;').replace('"', '&quot;').replace("'", "&#39;").replace("<", "&lt;").replace(">", "&gt;")
+                        links_html += f'<a href="javascript:void(0);" onclick="seekTo({start_sec});" style="color:#4da6ff;text-decoration:none;display:block;padding:4px 0;font-size:13px;border-bottom:1px solid #333;"><b>[{time_str}]</b> {preview}</a>'
+                    
+                    # Fixed height with scroll for all segments
+                    segment_html = f"""
+                    <div style="max-height:150px;overflow-y:auto;padding:8px;background:#1a1a1a;border-radius:5px;margin:5px 0;">
+                        {links_html}
+                    </div>
+                    <script>
+                        function seekTo(seconds) {{
+                            localStorage.setItem('audioSeekSeconds', seconds.toString());
+                            localStorage.setItem('audioSeekTime', Date.now().toString());
+                        }}
+                    </script>
+                    """
+                    components.html(segment_html, height=170)
+                
+                # Action row: dropdown, assign, edit, new speaker, delete
+                col_select, col_assign, col_edit, col_new, col_delete = st.columns([4, 1, 1, 1, 1])
+                
+                with col_select:
+                    current_speaker_display = speaker_id_to_display.get(current_speaker, "-- Not assigned --") if current_speaker else "-- Not assigned --"
+                    
+                    selected_speaker_display = st.selectbox(
+                        f"Speaker for {label}",
+                        options=speaker_names,
+                        index=speaker_names.index(current_speaker_display) if current_speaker_display in speaker_names else 0,
+                        key=f"speaker_{label}",
+                        label_visibility="collapsed"
+                    )
+                    
+                    new_speaker_id = speaker_display_to_id.get(selected_speaker_display) if selected_speaker_display != "-- Not assigned --" else None
+                
+                with col_assign:
+                    if new_speaker_id and new_speaker_id != current_speaker:
+                        if st.button("Assign", key=f"assign_{label}", type="primary"):
+                            result = assign_speaker_fast(call_id, label, new_speaker_id)
+                            
+                            if result['success']:
+                                st.success(f"{result['segments_updated']} segments assigned!")
+                                update_call_status(call_id)
+                                st.experimental_rerun()
+                            else:
+                                st.error(f"Error: {', '.join(result['errors'])}")
                     else:
-                        st.warning(f"**{label}**")
-                    st.caption(f"{count} Segmente · {duration:.0f}s")
+                        st.button("Assign", key=f"assign_{label}", disabled=True)
                 
-                with col2:
-                    # Sample text
-                    sample = (group[3] or "")[:300]
-                    st.caption(f"*\"{sample}...\"*" if len(sample) >= 300 else f"*\"{sample}\"*")
-                    
-                    col_select, col_button, col_delete = st.columns([3, 1, 1])
-                    
-                    with col_select:
-                        current_speaker_display = speaker_id_to_display.get(current_speaker, "-- Nicht zugeordnet --") if current_speaker else "-- Nicht zugeordnet --"
-                        
-                        selected_speaker_display = st.selectbox(
-                            f"Sprecher für {label}",
-                            options=speaker_names,
-                            index=speaker_names.index(current_speaker_display) if current_speaker_display in speaker_names else 0,
-                            key=f"speaker_{label}",
-                            label_visibility="collapsed"
-                        )
-                        
-                        new_speaker_id = speaker_display_to_id.get(selected_speaker_display) if selected_speaker_display != "-- Nicht zugeordnet --" else None
-                    
-                    with col_button:
-                        if new_speaker_id and new_speaker_id != current_speaker:
-                            if st.button(f"✓ Zuordnen", key=f"assign_{label}"):
-                                # Fast assignment - no embedding extraction
-                                result = assign_speaker_fast(call_id, label, new_speaker_id)
+                with col_edit:
+                    # Edit button - only enabled if a speaker is selected
+                    if new_speaker_id:
+                        if st.button("Edit", key=f"edit_speaker_{label}", help="Edit speaker details"):
+                            st.session_state[f'show_edit_speaker_dialog_{label}'] = new_speaker_id
+                    else:
+                        st.button("Edit", key=f"edit_speaker_{label}", disabled=True)
+                
+                with col_new:
+                    # New Speaker button - opens dialog
+                    if st.button("+ New", key=f"new_speaker_{label}", help="Create new speaker"):
+                        st.session_state[f'show_new_speaker_dialog_{label}'] = True
+                
+                with col_delete:
+                    if st.button("Delete", key=f"delete_{label}", help=f"Delete {label}"):
+                        st.session_state[f'confirm_delete_{label}'] = True
+                
+                # Edit Speaker Dialog
+                edit_speaker_id = st.session_state.get(f'show_edit_speaker_dialog_{label}')
+                if edit_speaker_id:
+                    speaker_details = get_speaker_details(edit_speaker_id)
+                    if speaker_details:
+                        with st.expander(f"Edit Speaker: {speaker_details['display_name']}", expanded=True):
+                            with st.form(f"edit_speaker_form_{label}"):
+                                edit_name = st.text_input("Name *", value=speaker_details['display_name'] or "", key=f"edit_name_{label}")
                                 
-                                if result['success']:
-                                    st.success(f"✅ {result['segments_updated']} Segmente zugeordnet!")
-                                    update_call_status(call_id)
+                                col_email, col_dept = st.columns(2)
+                                with col_email:
+                                    edit_email = st.text_input("Email", value=speaker_details['email'] or "", key=f"edit_email_{label}")
+                                with col_dept:
+                                    edit_dept = st.text_input("Department", value=speaker_details['department'] or "", key=f"edit_dept_{label}")
+                                
+                                col_company, col_notes = st.columns(2)
+                                with col_company:
+                                    edit_company = st.text_input("Company", value=speaker_details['company'] or "", key=f"edit_company_{label}")
+                                with col_notes:
+                                    edit_notes = st.text_input("Notes", value=speaker_details['notes'] or "", key=f"edit_notes_{label}")
+                                
+                                col_submit, col_cancel = st.columns(2)
+                                with col_submit:
+                                    save_btn = st.form_submit_button("Save Changes", type="primary")
+                                with col_cancel:
+                                    cancel_edit_btn = st.form_submit_button("Cancel")
+                                
+                                if save_btn:
+                                    if edit_name:
+                                        success = update_speaker(
+                                            edit_speaker_id,
+                                            edit_name,
+                                            edit_email if edit_email else None,
+                                            edit_dept if edit_dept else None,
+                                            edit_company if edit_company else None,
+                                            edit_notes if edit_notes else None
+                                        )
+                                        if success:
+                                            st.success(f"Speaker '{edit_name}' updated!")
+                                            del st.session_state[f'show_edit_speaker_dialog_{label}']
+                                            st.experimental_rerun()
+                                    else:
+                                        st.error("Name is required")
+                                
+                                if cancel_edit_btn:
+                                    del st.session_state[f'show_edit_speaker_dialog_{label}']
                                     st.experimental_rerun()
-                                else:
-                                    st.error(f"Fehler: {', '.join(result['errors'])}")
-                        elif not new_speaker_id:
-                            st.button("✓ Zuordnen", key=f"assign_{label}", disabled=True)
-                    
-                    with col_delete:
-                        if st.button("🗑️", key=f"delete_{label}", help=f"Lösche {label}"):
-                            st.session_state[f'confirm_delete_{label}'] = True
                 
+                # New Speaker Dialog
+                if st.session_state.get(f'show_new_speaker_dialog_{label}', False):
+                    with st.expander("Create New Speaker", expanded=True):
+                        with st.form(f"new_speaker_form_{label}"):
+                            new_name = st.text_input("Name *", key=f"new_name_{label}")
+                            
+                            col_email, col_dept = st.columns(2)
+                            with col_email:
+                                new_email = st.text_input("Email", key=f"new_email_{label}")
+                            with col_dept:
+                                new_dept = st.text_input("Department", key=f"new_dept_{label}")
+                            
+                            col_company, col_notes = st.columns(2)
+                            with col_company:
+                                new_company = st.text_input("Company", key=f"new_company_{label}")
+                            with col_notes:
+                                new_notes = st.text_input("Notes", key=f"new_notes_{label}")
+                            
+                            col_submit, col_cancel = st.columns(2)
+                            with col_submit:
+                                create_btn = st.form_submit_button("Create & Assign", type="primary")
+                            with col_cancel:
+                                cancel_btn = st.form_submit_button("Cancel")
+                            
+                            if create_btn:
+                                if new_name:
+                                    speaker_id = create_speaker(
+                                        new_name,
+                                        new_email if new_email else None,
+                                        new_dept if new_dept else None,
+                                        new_company if new_company else None,
+                                        new_notes if new_notes else None
+                                    )
+                                    if speaker_id:
+                                        # Immediately assign to this label
+                                        result = assign_speaker_fast(call_id, label, speaker_id)
+                                        if result['success']:
+                                            st.success(f"{new_name} created and assigned!")
+                                            del st.session_state[f'show_new_speaker_dialog_{label}']
+                                            update_call_status(call_id)
+                                            st.experimental_rerun()
+                                        else:
+                                            st.error(f"Assignment error: {', '.join(result['errors'])}")
+                                else:
+                                    st.error("Name is required")
+                            
+                            if cancel_btn:
+                                del st.session_state[f'show_new_speaker_dialog_{label}']
+                                st.experimental_rerun()
+                
+                # Delete confirmation
                 if st.session_state.get(f'confirm_delete_{label}', False):
-                    st.warning(f"Wirklich {count} Beiträge löschen?")
+                    st.warning(f"Really delete {count} contributions from {label}?")
                     c1, c2, c3 = st.columns([1, 1, 4])
                     with c1:
-                        if st.button("✓ Ja", key=f"yes_{label}"):
+                        if st.button("Yes, delete", key=f"yes_{label}", type="primary"):
                             success, message = delete_contributions(call_id, label)
                             if success:
                                 st.success(message)
@@ -766,7 +916,7 @@ else:
                             else:
                                 st.error(message)
                     with c2:
-                        if st.button("✗ Nein", key=f"no_{label}"):
+                        if st.button("Cancel", key=f"no_{label}"):
                             del st.session_state[f'confirm_delete_{label}']
                             st.experimental_rerun()
                 
@@ -774,15 +924,15 @@ else:
         
         # Progress bar
         progress = assignments_made / total_groups if total_groups > 0 else 0
-        st.progress(progress, text=f"Fortschritt: {assignments_made}/{total_groups} Sprecher zugeordnet")
+        st.progress(progress, text=f"Progress: {assignments_made}/{total_groups} speakers assigned")
         
         if assignments_made == total_groups:
-            st.success("✅ Alle Sprecher zugeordnet!")
-            if st.button("🔄 Seite aktualisieren"):
-                get_calls_cached.clear()
-                get_diarization_groups_cached.clear()
+            st.success("All speakers assigned!")
+            if st.button("Refresh Page"):
+                clear_all_caches()
+                clear_all_caches()
                 st.experimental_rerun()
 
 # Footer
 st.markdown("---")
-st.caption("Call Transcription - Speaker Classification mit Voice Matching")
+st.caption("Speaker Classification with Voice Matching")
