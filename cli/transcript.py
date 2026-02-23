@@ -248,7 +248,10 @@ def export_call(
     Returns:
         Path to saved file
     """
-    from . import snowflake_client
+    try:
+        from . import snowflake_client
+    except ImportError:
+        import snowflake_client
     
     # Get transcript data
     call_info, contributions = snowflake_client.get_transcript(call_id)

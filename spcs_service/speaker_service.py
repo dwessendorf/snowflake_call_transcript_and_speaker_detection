@@ -478,6 +478,167 @@ def extract_embedding_url():
         return jsonify({"data": [[0, {"status": "error", "error": str(e)}]]}), 500
 
 
+@app.route('/extract-embedding-batch', methods=['POST'])
+def extract_embedding_batch():
+    """Extract embeddings for multiple segments from a single audio URL (batch processing)
+    
+    Downloads audio ONCE and extracts embeddings for all segments in one pass.
+    Much faster than calling /extract-embedding-url multiple times.
+    
+    Request format:
+    {
+        "data": [[row_idx, audio_url, segments_json], ...]
+    }
+    where segments_json is a JSON string: [{"id": "contrib_id", "start": 0.0, "end": 5.0}, ...]
+    
+    Response format:
+    {
+        "data": [[row_idx, results_dict], ...]
+    }
+    where results_dict is {"status": "success", "embeddings": {"contrib_id": [...], ...}, "processed": N, "errors": [...]}
+    """
+    try:
+        import requests as http_requests
+        
+        data = request.get_json()
+        rows = data.get('data', [])
+        
+        results = []
+        for row in rows:
+            row_idx = row[0]
+            audio_url = row[1] if len(row) > 1 else None
+            segments_json = row[2] if len(row) > 2 else None
+            
+            if not audio_url:
+                results.append([row_idx, {"status": "error", "error": "No audio_url provided"}])
+                continue
+            
+            if not segments_json:
+                results.append([row_idx, {"status": "error", "error": "No segments provided"}])
+                continue
+            
+            try:
+                # Parse segments
+                if isinstance(segments_json, str):
+                    segments = json.loads(segments_json)
+                else:
+                    segments = segments_json
+                
+                if not segments:
+                    results.append([row_idx, {"status": "error", "error": "Empty segments list"}])
+                    continue
+                
+                logger.info(f"Batch processing {len(segments)} segments from single audio download")
+                
+                # Download audio ONCE
+                logger.info(f"Downloading audio from URL...")
+                response = http_requests.get(audio_url, timeout=300)
+                
+                if response.status_code != 200:
+                    results.append([row_idx, {"status": "error", "error": f"HTTP {response.status_code}"}])
+                    continue
+                
+                audio_bytes = response.content
+                logger.info(f"Downloaded {len(audio_bytes)} bytes, processing {len(segments)} segments")
+                
+                # Load audio once with pydub
+                from pydub import AudioSegment
+                import io
+                
+                try:
+                    full_audio = AudioSegment.from_file(io.BytesIO(audio_bytes))
+                    logger.info(f"Loaded full audio: {len(full_audio)}ms, {full_audio.frame_rate}Hz")
+                except Exception as e:
+                    results.append([row_idx, {"status": "error", "error": f"Failed to load audio: {e}"}])
+                    continue
+                
+                # Process all segments
+                embeddings = {}
+                errors = []
+                processed = 0
+                
+                for seg in segments:
+                    seg_id = seg.get('id', f"seg_{processed}")
+                    start_time = float(seg.get('start', 0))
+                    end_time = float(seg.get('end', 0))
+                    
+                    # Skip very short segments
+                    if (end_time - start_time) < 0.5:
+                        errors.append(f"{seg_id}: segment too short ({end_time - start_time:.1f}s)")
+                        continue
+                    
+                    try:
+                        # Extract segment from full audio
+                        start_ms = int(start_time * 1000)
+                        end_ms = int(end_time * 1000)
+                        segment_audio = full_audio[start_ms:end_ms]
+                        
+                        if len(segment_audio) < 500:  # Less than 0.5 seconds
+                            errors.append(f"{seg_id}: extracted segment too short")
+                            continue
+                        
+                        # Convert to mono and resample if needed
+                        if segment_audio.channels > 1:
+                            segment_audio = segment_audio.set_channels(1)
+                        if segment_audio.frame_rate != 16000:
+                            segment_audio = segment_audio.set_frame_rate(16000)
+                        
+                        # Export to WAV and extract embedding
+                        wav_buffer = io.BytesIO()
+                        segment_audio.export(wav_buffer, format="wav")
+                        wav_buffer.seek(0)
+                        
+                        from scipy.io import wavfile
+                        import torch
+                        
+                        sample_rate, audio_data = wavfile.read(wav_buffer)
+                        
+                        # Convert to float
+                        if audio_data.dtype == np.int16:
+                            audio_data = audio_data.astype(np.float32) / 32768.0
+                        elif audio_data.dtype == np.int32:
+                            audio_data = audio_data.astype(np.float32) / 2147483648.0
+                        elif audio_data.dtype != np.float32:
+                            audio_data = audio_data.astype(np.float32)
+                        
+                        # Extract embedding
+                        if not load_model():
+                            errors.append(f"{seg_id}: model not loaded")
+                            continue
+                        
+                        waveform = torch.from_numpy(audio_data).unsqueeze(0)
+                        with torch.no_grad():
+                            embedding = CLASSIFIER.encode_batch(waveform)
+                            embedding = embedding.squeeze().cpu().numpy()
+                        
+                        # Normalize
+                        embedding = embedding / np.linalg.norm(embedding)
+                        embeddings[seg_id] = embedding.tolist()
+                        processed += 1
+                        
+                    except Exception as e:
+                        errors.append(f"{seg_id}: {str(e)}")
+                
+                logger.info(f"Batch complete: {processed}/{len(segments)} segments processed")
+                results.append([row_idx, {
+                    "status": "success",
+                    "embeddings": embeddings,
+                    "processed": processed,
+                    "total": len(segments),
+                    "errors": errors[:10]  # Limit error list
+                }])
+                
+            except Exception as e:
+                logger.error(f"Error processing batch row {row_idx}: {e}")
+                results.append([row_idx, {"status": "error", "error": str(e)}])
+        
+        return jsonify({"data": results})
+        
+    except Exception as e:
+        logger.error(f"Error in extract-embedding-batch: {e}")
+        return jsonify({"data": [[0, {"status": "error", "error": str(e)}]]}), 500
+
+
 @app.route('/match', methods=['POST'])
 def match_embedding():
     """Match an embedding against stored profiles"""

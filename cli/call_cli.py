@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+/q#!/usr/bin/env python3
 """
 Call Upload CLI
 Upload call recordings, monitor transcription, and export transcripts.

@@ -5,7 +5,7 @@ This module provides a CustomModel wrapper for the SpeechBrain ECAPA-TDNN
 speaker embedding model, designed for deployment via Snowflake Model Registry
 with Real-time Inference REST API.
 
-Uses torchaudio for audio processing (no pydub/ffmpeg dependency).
+Uses soundfile for audio processing with torchaudio fallback.
 
 Features:
 - extract_embedding: Extract 192-dim speaker embeddings from audio
@@ -23,6 +23,11 @@ Usage:
     # Deploy as real-time service
     deploy_service(mv, "speaker_embedding_svc")
 """
+
+# Patch torchaudio before importing speechbrain (compatibility fix for torchaudio 2.10+)
+import torchaudio
+if not hasattr(torchaudio, 'list_audio_backends'):
+    torchaudio.list_audio_backends = lambda: ['default']
 
 import io
 import base64
@@ -70,6 +75,21 @@ def create_model_class():
         def _load_model(self):
             """Lazy load the SpeechBrain model"""
             if self._classifier is None:
+                import os
+                
+                # Set HuggingFace cache to writable temp directory
+                # SPCS containers may not have write access to /root/.cache
+                os.environ['HF_HOME'] = '/tmp/huggingface_cache'
+                os.environ['HUGGINGFACE_HUB_CACHE'] = '/tmp/huggingface_cache'
+                os.makedirs('/tmp/huggingface_cache', exist_ok=True)
+                
+                # CRITICAL: Patch torchaudio BEFORE importing speechbrain
+                # torchaudio 2.1+ removed list_audio_backends(), which SpeechBrain requires
+                import torchaudio
+                if not hasattr(torchaudio, 'list_audio_backends'):
+                    torchaudio.list_audio_backends = lambda: ['default']
+                    logger.info("Patched torchaudio.list_audio_backends for compatibility")
+                
                 from speechbrain.inference.speaker import EncoderClassifier
                 
                 logger.info("Loading SpeechBrain ECAPA-TDNN model...")
@@ -98,12 +118,37 @@ def create_model_class():
                 192-dimensional normalized embedding or None on error
             """
             import torch
-            import torchaudio
+            import numpy as np
             
             try:
-                # Load audio from bytes using torchaudio
-                audio_buffer = io.BytesIO(audio_bytes)
-                waveform, sample_rate = torchaudio.load(audio_buffer)
+                # Try loading with soundfile first (more reliable)
+                waveform = None
+                sample_rate = None
+                try:
+                    import soundfile as sf
+                    audio_buffer = io.BytesIO(audio_bytes)
+                    data, sample_rate = sf.read(audio_buffer)
+                    waveform = torch.from_numpy(data.astype(np.float32))
+                    # Ensure correct shape (channels, samples)
+                    if len(waveform.shape) == 1:
+                        waveform = waveform.unsqueeze(0)
+                    elif waveform.shape[0] > waveform.shape[1]:  # If (samples, channels), transpose
+                        waveform = waveform.T
+                    logger.info(f"Loaded audio with soundfile: {waveform.shape}, {sample_rate}Hz")
+                except Exception as sf_err:
+                    logger.warning(f"soundfile failed: {sf_err}, trying torchaudio")
+                    # Fallback to torchaudio
+                    try:
+                        import torchaudio
+                        audio_buffer = io.BytesIO(audio_bytes)
+                        waveform, sample_rate = torchaudio.load(audio_buffer, format='wav')
+                        logger.info(f"Loaded audio with torchaudio: {waveform.shape}, {sample_rate}Hz")
+                    except Exception as ta_err:
+                        logger.error(f"Both soundfile and torchaudio failed. soundfile: {sf_err}, torchaudio: {ta_err}")
+                        raise ValueError(f"Failed to load audio: soundfile={sf_err}, torchaudio={ta_err}")
+                
+                if waveform is None:
+                    raise ValueError("Failed to load audio: waveform is None")
                 
                 logger.debug(f"Loaded audio: {waveform.shape}, {sample_rate}Hz")
                 
@@ -116,8 +161,17 @@ def create_model_class():
                 
                 # Resample to 16kHz if needed (model requirement)
                 if sample_rate != 16000:
-                    resampler = torchaudio.transforms.Resample(sample_rate, 16000)
-                    waveform = resampler(waveform)
+                    try:
+                        import torchaudio
+                        resampler = torchaudio.transforms.Resample(sample_rate, 16000)
+                        waveform = resampler(waveform)
+                    except (ImportError, Exception) as e:
+                        # Simple linear interpolation resampling as fallback
+                        logger.info(f"Using fallback resampling: {e}")
+                        import torch.nn.functional as F
+                        ratio = 16000 / sample_rate
+                        new_length = int(waveform.shape[1] * ratio)
+                        waveform = F.interpolate(waveform.unsqueeze(0), size=new_length, mode='linear', align_corners=False).squeeze(0)
                     sample_rate = 16000
                 
                 # Convert stereo to mono
@@ -143,7 +197,8 @@ def create_model_class():
                 return embedding
                 
             except Exception as e:
-                logger.error(f"Error processing audio: {e}")
+                import traceback
+                logger.error(f"Error processing audio: {e}\n{traceback.format_exc()}")
                 return None
         
         def _download_from_url(self, url: str, timeout: int = 120) -> Optional[bytes]:
@@ -292,6 +347,128 @@ def create_model_class():
                 except Exception as e:
                     results.append({
                         "embedding": None,
+                        "status": "error",
+                        "error": str(e)
+                    })
+            
+            return pd.DataFrame(results)
+        
+        @custom_model.inference_api
+        def extract_embedding_batch(self, input_df: pd.DataFrame) -> pd.DataFrame:
+            """
+            Extract speaker embeddings for multiple segments from a single audio URL.
+            
+            Downloads audio ONCE and extracts embeddings for all segments - much faster
+            than calling extract_embedding_url multiple times.
+            
+            Input DataFrame columns:
+                - audio_url (str): Presigned URL to audio file
+                - segments_json (str): JSON array of segments: [{"id": "...", "start": 0.0, "end": 5.0}, ...]
+            
+            Output DataFrame columns:
+                - embeddings_json (str): JSON dict mapping segment id to embedding array
+                - processed (int): Number of segments successfully processed
+                - total (int): Total number of segments
+                - status (str): "success" or "error"
+                - error (str): Error message if status is "error"
+            """
+            results = []
+            
+            for idx, row in input_df.iterrows():
+                audio_url = row.get("audio_url") or (row.iloc[0] if len(row) > 0 else None)
+                segments_json = row.get("segments_json") or (row.iloc[1] if len(row) > 1 else None)
+                
+                if not audio_url:
+                    results.append({
+                        "embeddings_json": None,
+                        "processed": 0,
+                        "total": 0,
+                        "status": "error",
+                        "error": "No audio_url provided"
+                    })
+                    continue
+                
+                if not segments_json:
+                    results.append({
+                        "embeddings_json": None,
+                        "processed": 0,
+                        "total": 0,
+                        "status": "error",
+                        "error": "No segments_json provided"
+                    })
+                    continue
+                
+                try:
+                    # Parse segments
+                    segments = json.loads(segments_json) if isinstance(segments_json, str) else segments_json
+                    
+                    if not segments:
+                        results.append({
+                            "embeddings_json": None,
+                            "processed": 0,
+                            "total": 0,
+                            "status": "error",
+                            "error": "Empty segments list"
+                        })
+                        continue
+                    
+                    # Download audio ONCE
+                    logger.info(f"Batch: downloading audio for {len(segments)} segments...")
+                    audio_bytes = self._download_from_url(audio_url, timeout=300)
+                    
+                    if audio_bytes is None:
+                        results.append({
+                            "embeddings_json": None,
+                            "processed": 0,
+                            "total": len(segments),
+                            "status": "error",
+                            "error": "Failed to download audio from URL"
+                        })
+                        continue
+                    
+                    logger.info(f"Batch: downloaded {len(audio_bytes)} bytes, processing {len(segments)} segments")
+                    
+                    # Process all segments from the same audio bytes
+                    embeddings = {}
+                    processed = 0
+                    errors = []
+                    
+                    for seg in segments:
+                        seg_id = seg.get("id", f"seg_{processed}")
+                        start_time = float(seg.get("start", 0))
+                        end_time = float(seg.get("end", 0))
+                        
+                        # Skip very short segments
+                        if (end_time - start_time) < 0.5:
+                            errors.append(f"{seg_id}: too short")
+                            continue
+                        
+                        try:
+                            embedding = self._process_audio_bytes(audio_bytes, start_time, end_time)
+                            
+                            if embedding is not None:
+                                embeddings[seg_id] = embedding.tolist()
+                                processed += 1
+                            else:
+                                errors.append(f"{seg_id}: extraction failed")
+                        except Exception as e:
+                            errors.append(f"{seg_id}: {str(e)}")
+                    
+                    logger.info(f"Batch complete: {processed}/{len(segments)} segments processed")
+                    
+                    results.append({
+                        "embeddings_json": json.dumps(embeddings),
+                        "processed": processed,
+                        "total": len(segments),
+                        "status": "success",
+                        "error": json.dumps(errors[:10]) if errors else None
+                    })
+                    
+                except Exception as e:
+                    results.append({
+                        "embeddings_json": None,
+                        "processed": 0,
+                        "total": 0,
                         "status": "error",
                         "error": str(e)
                     })
@@ -516,6 +693,21 @@ def register_model(
         ]
     )
     
+    # Batch extraction signature - downloads audio once, extracts all segments
+    extract_batch_sig = model_signature.ModelSignature(
+        inputs=[
+            model_signature.FeatureSpec(name="audio_url", dtype=model_signature.DataType.STRING),
+            model_signature.FeatureSpec(name="segments_json", dtype=model_signature.DataType.STRING),
+        ],
+        outputs=[
+            model_signature.FeatureSpec(name="embeddings_json", dtype=model_signature.DataType.STRING),
+            model_signature.FeatureSpec(name="processed", dtype=model_signature.DataType.INT64),
+            model_signature.FeatureSpec(name="total", dtype=model_signature.DataType.INT64),
+            model_signature.FeatureSpec(name="status", dtype=model_signature.DataType.STRING),
+            model_signature.FeatureSpec(name="error", dtype=model_signature.DataType.STRING),
+        ]
+    )
+    
     similarity_sig = model_signature.ModelSignature(
         inputs=[
             model_signature.FeatureSpec(name="embedding1", dtype=model_signature.DataType.STRING),
@@ -573,20 +765,20 @@ def register_model(
             "speechbrain>=1.0.0",
             "torch>=2.0.0",
             "torchaudio>=2.0.0",
+            "soundfile>=0.12.0",  # For reliable audio loading (requires libsndfile)
             "numpy>=1.20.0",
             "requests>=2.25.0",
+            "huggingface_hub<0.25",  # Fix for use_auth_token deprecation
         ],
         signatures={
             "extract_embedding": extract_sig,
             "extract_embedding_url": extract_url_sig,
+            "extract_embedding_batch": extract_batch_sig,
             "compute_similarity": similarity_sig,
             "batch_match": batch_match_sig,
             "health": health_sig,
         },
         comment="SpeechBrain ECAPA-TDNN speaker embedding model (192-dim) with URL support",
-        options={
-            "relax_version": True,
-        }
     )
     
     logger.info(f"Model registered: {model_name}/{version_name}")

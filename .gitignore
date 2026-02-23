@@ -65,5 +65,8 @@ tmp/
 temp/
 *.tmp
 
-# Converted audio (CLI creates these)
+# Data and output folders
+test_data/
+demo_data/
 converted/
+backup/
