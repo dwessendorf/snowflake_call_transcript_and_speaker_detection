@@ -4,7 +4,7 @@ Register and deploy the Speaker Embedding model to Snowflake Model Registry.
 
 This script:
 1. Registers the SpeechBrain ECAPA-TDNN model in Snowflake Model Registry
-2. Deploys it as a real-time inference service
+2. Deploys it as a GPU inference service on SPCS
 
 Prerequisites:
 - snowflake-ml-python >= 1.5.0
@@ -15,7 +15,7 @@ Usage:
     python register_model.py [--connection CONNECTION_NAME]
 
 Example:
-    python register_model.py --connection my_snowflake_connection
+    python register_model.py --connection DWESSENDORF_AWS1
 """
 
 import argparse
@@ -47,8 +47,8 @@ def get_session(connection_name: str = None):
     return session
 
 
-def register_and_deploy(session, model_name: str = "SPEAKER_EMBEDDING", version: str = "v9"):
-    """Register model and deploy as service."""
+def register_and_deploy(session, model_name: str = "SPEAKER_EMBEDDING", version: str = "V20_GPU"):
+    """Register model and deploy as GPU service."""
     from speaker_model_registry import register_model, deploy_service
     
     # Set context
@@ -70,13 +70,13 @@ def register_and_deploy(session, model_name: str = "SPEAKER_EMBEDDING", version:
     logger.info(f"Model registered successfully")
     
     # Deploy as service
-    service_name = f"{model_name}_SVC_{version.upper()}"
+    service_name = "SPEAKER_EMBEDDING_SVC"
     logger.info(f"Deploying service {service_name}...")
     
     deploy_service(
         model_version=mv,
         service_name=service_name,
-        compute_pool="SYSTEM_COMPUTE_POOL_GPU",  # Use system GPU pool
+        compute_pool="SPEAKER_IDENTIFICATION_POOL",
         gpu_requests="1",
         max_instances=1,
         min_instances=1
@@ -94,7 +94,7 @@ def main():
     parser = argparse.ArgumentParser(description="Register and deploy Speaker Embedding model")
     parser.add_argument("--connection", "-c", help="Snowflake connection name from connections.toml")
     parser.add_argument("--model-name", default="SPEAKER_EMBEDDING", help="Model name in registry")
-    parser.add_argument("--version", default="v9", help="Model version")
+    parser.add_argument("--version", default="V20_GPU", help="Model version")
     args = parser.parse_args()
     
     try:

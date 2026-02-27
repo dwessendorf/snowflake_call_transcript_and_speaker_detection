@@ -10,12 +10,10 @@
 --   - Cortex AI functions enabled in your region
 --   - For cross-region Cortex: ALTER ACCOUNT SET CORTEX_ENABLED_CROSS_REGION = 'ANY_REGION';
 --
--- Supported Snowflake accounts: AWS and Azure regions
---
 -- ============================================================================
 
 -- ============================================================================
--- PART 1: Database, Schema, and Warehouse
+-- PART 1: Database, Schema, and Warehouses
 -- ============================================================================
 
 CREATE DATABASE IF NOT EXISTS CALL_TRANSCRIPTS_DB
@@ -26,6 +24,7 @@ CREATE SCHEMA IF NOT EXISTS CALL_TRANSCRIPTS_DB.TRANSCRIPTS
 
 USE SCHEMA CALL_TRANSCRIPTS_DB.TRANSCRIPTS;
 
+-- Main warehouse for transcription operations
 CREATE WAREHOUSE IF NOT EXISTS CALL_TRANSCRIPTS_WH
     WAREHOUSE_SIZE = 'SMALL'
     AUTO_SUSPEND = 300
@@ -33,10 +32,19 @@ CREATE WAREHOUSE IF NOT EXISTS CALL_TRANSCRIPTS_WH
     INITIALLY_SUSPENDED = TRUE
     COMMENT = 'Warehouse for call transcription operations';
 
+-- Warehouse for Streamlit app
+CREATE WAREHOUSE IF NOT EXISTS STREAMLIT_APP_WH
+    WAREHOUSE_SIZE = 'X-SMALL'
+    AUTO_SUSPEND = 60
+    AUTO_RESUME = TRUE
+    INITIALLY_SUSPENDED = TRUE
+    COMMENT = 'Warehouse for Streamlit speaker assignment app';
+
 -- Grant usage
 GRANT USAGE ON DATABASE CALL_TRANSCRIPTS_DB TO ROLE ACCOUNTADMIN;
 GRANT USAGE ON SCHEMA CALL_TRANSCRIPTS_DB.TRANSCRIPTS TO ROLE ACCOUNTADMIN;
 GRANT USAGE ON WAREHOUSE CALL_TRANSCRIPTS_WH TO ROLE ACCOUNTADMIN;
+GRANT USAGE ON WAREHOUSE STREAMLIT_APP_WH TO ROLE ACCOUNTADMIN;
 
 USE WAREHOUSE CALL_TRANSCRIPTS_WH;
 
@@ -98,6 +106,7 @@ CREATE TABLE IF NOT EXISTS CALL_CONTRIBUTIONS (
     MATCHED_PROFILE_ID VARCHAR(50),
     AUDIO_SNIPPET_PATH VARCHAR(500),
     EMBEDDING VECTOR(FLOAT, 192),
+    EMBEDDING_STATUS VARCHAR(20),  -- SUCCESS, FAILED, TOO_SHORT, NULL=pending
     TEXT_CONTENT VARCHAR(100000),
     START_TIME_SECONDS FLOAT,
     END_TIME_SECONDS FLOAT,
@@ -126,9 +135,69 @@ CREATE TABLE IF NOT EXISTS SPEAKER_VOICEPRINTS (
     METADATA VARIANT
 );
 
+-- Speaker profiles (for future multi-profile support)
+CREATE TABLE IF NOT EXISTS SPEAKER_PROFILES (
+    PROFILE_ID VARCHAR(50) NOT NULL PRIMARY KEY,
+    SPEAKER_ID VARCHAR(50) NOT NULL REFERENCES SPEAKERS(SPEAKER_ID),
+    PROFILE_TYPE VARCHAR(50) DEFAULT 'voice',
+    EMBEDDING VECTOR(FLOAT, 192),
+    SAMPLE_AUDIO_PATH VARCHAR(500),
+    SAMPLE_DURATION_SECONDS FLOAT,
+    QUALITY_SCORE FLOAT,
+    CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    UPDATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    METADATA VARIANT
+);
+
+-- Classification queue (for manual review workflow)
+CREATE TABLE IF NOT EXISTS CLASSIFICATION_QUEUE (
+    QUEUE_ID VARCHAR(50) NOT NULL PRIMARY KEY,
+    CALL_ID VARCHAR(50) NOT NULL REFERENCES CALLS(CALL_ID),
+    CONTRIBUTION_ID VARCHAR(50) NOT NULL REFERENCES CALL_CONTRIBUTIONS(CONTRIBUTION_ID),
+    DIARIZATION_LABEL VARCHAR(20),
+    SUGGESTED_SPEAKER_ID VARCHAR(50),
+    SUGGESTED_SPEAKER_NAME VARCHAR(200),
+    SUGGESTION_CONFIDENCE FLOAT,
+    ALTERNATIVE_SUGGESTIONS VARIANT,
+    AUDIO_SNIPPET_PATH VARCHAR(500),
+    SNIPPET_DURATION_SECONDS FLOAT,
+    TEXT_PREVIEW VARCHAR(1000),
+    STATUS VARCHAR(50) DEFAULT 'pending',
+    PRIORITY NUMBER DEFAULT 5,
+    ASSIGNED_TO VARCHAR(100),
+    ASSIGNED_AT TIMESTAMP_NTZ,
+    SELECTED_SPEAKER_ID VARCHAR(50),
+    CREATED_NEW_SPEAKER BOOLEAN DEFAULT FALSE,
+    NEW_PROFILE_CREATED BOOLEAN DEFAULT FALSE,
+    CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    COMPLETED_AT TIMESTAMP_NTZ,
+    COMPLETED_BY VARCHAR(100),
+    METADATA VARIANT
+);
+
+-- Voiceprint creation queue (async processing)
+CREATE TABLE IF NOT EXISTS VOICEPRINT_QUEUE (
+    QUEUE_ID VARCHAR NOT NULL DEFAULT UUID_STRING() PRIMARY KEY,
+    SPEAKER_ID VARCHAR NOT NULL,
+    CALL_ID VARCHAR NOT NULL,
+    DIARIZATION_LABEL VARCHAR NOT NULL,
+    CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    STATUS VARCHAR DEFAULT 'pending'
+);
+
+-- Contribution embeddings (separate storage, for future use)
+CREATE TABLE IF NOT EXISTS CONTRIBUTION_EMBEDDINGS (
+    CONTRIBUTION_ID VARCHAR(50) NOT NULL PRIMARY KEY,
+    CALL_ID VARCHAR(50) NOT NULL,
+    EMBEDDING VECTOR(FLOAT, 192),
+    CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
 -- Indexes for performance
 CREATE INDEX IF NOT EXISTS idx_contributions_call ON CALL_CONTRIBUTIONS(CALL_ID);
 CREATE INDEX IF NOT EXISTS idx_contributions_speaker ON CALL_CONTRIBUTIONS(IDENTIFIED_SPEAKER_ID);
+CREATE INDEX IF NOT EXISTS idx_queue_call ON CLASSIFICATION_QUEUE(CALL_ID);
+CREATE INDEX IF NOT EXISTS idx_queue_status ON CLASSIFICATION_QUEUE(STATUS);
 
 -- ============================================================================
 -- PART 3: Stages
@@ -147,7 +216,7 @@ CREATE STAGE IF NOT EXISTS AUDIO_SNIPPETS
     COMMENT = 'Audio snippets of individual speech segments';
 
 -- ============================================================================
--- PART 4: Network Rules for External Access
+-- PART 4: Network Rules for External Access (GPU Service)
 -- ============================================================================
 -- Required for Model Registry service to download audio from presigned URLs
 -- and to download HuggingFace models
@@ -197,7 +266,19 @@ CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION MODEL_REGISTRY_EXTERNAL_ACCESS
     COMMENT = 'External access for Model Registry speaker embedding service';
 
 -- ============================================================================
--- PART 5: Transcription Procedure (Cortex AI_TRANSCRIBE)
+-- PART 5: Compute Pool for GPU Service
+-- ============================================================================
+
+CREATE COMPUTE POOL IF NOT EXISTS SPEAKER_IDENTIFICATION_POOL
+    MIN_NODES = 1
+    MAX_NODES = 1
+    INSTANCE_FAMILY = GPU_NV_S
+    AUTO_SUSPEND_SECS = 300
+    AUTO_RESUME = TRUE
+    COMMENT = 'GPU compute pool for speaker embedding extraction';
+
+-- ============================================================================
+-- PART 6: Transcription Procedure (Cortex AI_TRANSCRIBE)
 -- ============================================================================
 
 CREATE OR REPLACE PROCEDURE TRANSCRIBE_CALL(P_CALL_ID VARCHAR)
@@ -347,83 +428,81 @@ def transcribe_call(session, p_call_id):
 $$;
 
 -- ============================================================================
--- PART 6: Speaker Enrollment Procedure
+-- PART 7: Speaker Voiceprint Creation Procedure
 -- ============================================================================
 
-CREATE OR REPLACE PROCEDURE ENROLL_SPEAKER_FROM_CONTRIBUTION(
-    P_SPEAKER_ID VARCHAR,
-    P_SPEAKER_NAME VARCHAR,
-    P_CALL_ID VARCHAR,
+CREATE OR REPLACE PROCEDURE CREATE_SPEAKER_VOICEPRINT_FROM_CONTRIBUTION(
+    P_SPEAKER_ID VARCHAR, 
+    P_CALL_ID VARCHAR, 
     P_DIARIZATION_LABEL VARCHAR
 )
 RETURNS VARIANT
 LANGUAGE PYTHON
 RUNTIME_VERSION = '3.11'
 PACKAGES = ('snowflake-snowpark-python')
-HANDLER = 'enroll_speaker'
+HANDLER = 'create_voiceprint'
 EXECUTE AS OWNER
-AS $$
+AS '
 import json
 
-def enroll_speaker(session, p_speaker_id, p_speaker_name, p_call_id, p_diarization_label):
-    """Enroll a speaker by creating voiceprint from a contribution segment"""
+def create_voiceprint(session, p_speaker_id, p_call_id, p_diarization_label):
     try:
-        # Find best contribution (longest duration >= 5s)
+        # Find a suitable contribution (at least 10 seconds) for this speaker
         contrib = session.sql(f"""
             SELECT cc.contribution_id, cc.start_time_seconds, cc.end_time_seconds,
                    cc.duration_seconds, c.recording_path
-            FROM CALL_TRANSCRIPTS_DB.TRANSCRIPTS.CALL_CONTRIBUTIONS cc
-            JOIN CALL_TRANSCRIPTS_DB.TRANSCRIPTS.CALLS c ON cc.call_id = c.call_id
-            WHERE cc.call_id = '{p_call_id}'
-            AND cc.diarization_label = '{p_diarization_label}'
-            AND cc.duration_seconds >= 5
+            FROM CALL_CONTRIBUTIONS cc
+            JOIN CALLS c ON cc.call_id = c.call_id
+            WHERE cc.call_id = ''{p_call_id}''
+            AND cc.diarization_label = ''{p_diarization_label}''
+            AND cc.duration_seconds >= 10
             ORDER BY cc.duration_seconds DESC
             LIMIT 1
         """).collect()
         
         if not contrib:
-            return {"status": "error", "message": "No suitable contribution found (need >= 5 seconds)"}
+            return {"status": "error", "message": "No suitable contribution found (need >= 10s)"}
         
-        start_time = float(contrib[0]['START_TIME_SECONDS'])
-        end_time = float(contrib[0]['END_TIME_SECONDS'])
-        duration = float(contrib[0]['DURATION_SECONDS'])
-        recording_path = contrib[0]['RECORDING_PATH']
+        contribution_id = contrib[0][''CONTRIBUTION_ID'']
+        start_time = float(contrib[0][''START_TIME_SECONDS''])
+        end_time = float(contrib[0][''END_TIME_SECONDS''])
+        duration = float(contrib[0][''DURATION_SECONDS''])
+        recording_path = contrib[0][''RECORDING_PATH'']
         
-        # Parse stage path
-        stage_path = recording_path.lstrip('@')
-        parts = stage_path.split('/')
-        if len(parts) < 2:
+        # Parse the stage path to get presigned URL
+        stage_path = recording_path.lstrip(''@'')
+        if ''/'' in stage_path:
+            parts = stage_path.split(''/'', 1)
+            stage_name = ''@'' + parts[0]
+            file_name = parts[1]
+        else:
             return {"status": "error", "message": "Invalid recording path"}
         
-        stage_name = '@' + '/'.join(parts[:-1])
-        file_name = parts[-1]
-        
-        # Get presigned URL
         url_result = session.sql(f"""
-            SELECT GET_PRESIGNED_URL('{stage_name}', '{file_name}', 3600) as url
+            SELECT GET_PRESIGNED_URL(''{stage_name}'', ''{file_name}'', 3600) as url
         """).collect()
         
-        if not url_result or not url_result[0]['URL']:
+        if not url_result or not url_result[0][''URL'']:
             return {"status": "error", "message": "Could not get presigned URL"}
         
-        presigned_url = url_result[0]['URL']
+        presigned_url = url_result[0][''URL'']
         
-        # Extract embedding via speaker embedding service
+        # Extract embedding from the audio segment
         result = session.sql(f"""
-            SELECT SPEAKER_EMBEDDING_V9('{presigned_url}', {start_time}, {end_time}) as result
+            SELECT SPEAKER_EMBEDDING_URL(''{presigned_url}'', {start_time}, {end_time}) as result
         """).collect()
         
-        if not result or not result[0]['RESULT']:
+        if not result or not result[0][''RESULT'']:
             return {"status": "error", "message": "No result from embedding service"}
         
-        svc_result = result[0]['RESULT']
+        svc_result = result[0][''RESULT'']
         if isinstance(svc_result, str):
             svc_result = json.loads(svc_result)
         
-        if svc_result.get('status') == 'error':
-            return {"status": "error", "message": svc_result.get('error', 'Unknown error')}
+        if svc_result.get(''status'') == ''error'':
+            return {"status": "error", "message": svc_result.get(''error'', ''Unknown error'')}
         
-        embedding = svc_result.get('embedding')
+        embedding = svc_result.get(''embedding'')
         if not embedding:
             return {"status": "error", "message": "No embedding returned"}
         
@@ -432,231 +511,188 @@ def enroll_speaker(session, p_speaker_id, p_speaker_name, p_call_id, p_diarizati
         
         embedding_json = json.dumps(embedding)
         
-        # Create/update speaker record
-        session.sql(f"""
-            MERGE INTO CALL_TRANSCRIPTS_DB.TRANSCRIPTS.SPEAKERS t
-            USING (SELECT '{p_speaker_id}' as speaker_id) s
-            ON t.speaker_id = s.speaker_id
-            WHEN MATCHED THEN UPDATE SET
-                display_name = '{p_speaker_name.replace("'", "''")}',
-                updated_at = CURRENT_TIMESTAMP()
-            WHEN NOT MATCHED THEN INSERT (speaker_id, display_name, created_at, updated_at)
-            VALUES ('{p_speaker_id}', '{p_speaker_name.replace("'", "''")}', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())
+        # Get speaker info
+        speaker = session.sql(f"""
+            SELECT display_name, email, department 
+            FROM SPEAKERS 
+            WHERE speaker_id = ''{p_speaker_id}''
         """).collect()
         
-        # Create/update voiceprint
+        if not speaker:
+            return {"status": "error", "message": "Speaker not found"}
+        
+        speaker_name = speaker[0][''DISPLAY_NAME''].replace("''", "''''")
+        email = (speaker[0][''EMAIL''] or '''').replace("''", "''''")
+        department = (speaker[0][''DEPARTMENT''] or '''').replace("''", "''''")
+        
+        # Upsert the voiceprint
         session.sql(f"""
-            MERGE INTO CALL_TRANSCRIPTS_DB.TRANSCRIPTS.SPEAKER_VOICEPRINTS t
-            USING (SELECT '{p_speaker_id}' as speaker_id) s
+            MERGE INTO SPEAKER_VOICEPRINTS t
+            USING (SELECT ''{p_speaker_id}'' as speaker_id) s
             ON t.speaker_id = s.speaker_id
             WHEN MATCHED THEN UPDATE SET
-                speaker_name = '{p_speaker_name.replace("'", "''")}',
-                embedding = PARSE_JSON('{embedding_json}')::VECTOR(FLOAT, 192),
-                sample_audio_path = '{recording_path}',
+                speaker_name = ''{speaker_name}'',
+                email = ''{email}'',
+                department = ''{department}'',
+                embedding = PARSE_JSON(''{embedding_json}'')::VECTOR(FLOAT, 192),
+                sample_audio_path = ''{recording_path}'',
                 sample_duration_seconds = {duration},
                 last_updated = CURRENT_TIMESTAMP()
             WHEN NOT MATCHED THEN INSERT (
-                speaker_id, speaker_name, embedding, sample_audio_path, 
-                sample_duration_seconds, enrollment_date, last_updated
+                speaker_id, speaker_name, email, department, embedding,
+                sample_audio_path, sample_duration_seconds, enrollment_date, last_updated
             ) VALUES (
-                '{p_speaker_id}', '{p_speaker_name.replace("'", "''")}',
-                PARSE_JSON('{embedding_json}')::VECTOR(FLOAT, 192),
-                '{recording_path}', {duration}, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
+                ''{p_speaker_id}'', ''{speaker_name}'', ''{email}'', ''{department}'',
+                PARSE_JSON(''{embedding_json}'')::VECTOR(FLOAT, 192),
+                ''{recording_path}'', {duration}, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
             )
         """).collect()
         
         return {
             "status": "success",
             "speaker_id": p_speaker_id,
-            "speaker_name": p_speaker_name,
-            "duration_seconds": duration
+            "speaker_name": speaker_name,
+            "duration_seconds": duration,
+            "contribution_id": contribution_id
         }
         
     except Exception as e:
         return {"status": "error", "message": str(e)}
-$$;
+';
 
 -- ============================================================================
--- PART 7: Auto Speaker Detection Procedure
+-- PART 8: Embedding Extraction Procedure (Bulk/Batch)
 -- ============================================================================
 
-CREATE OR REPLACE PROCEDURE AUTO_DETECT_SPEAKERS(
-    P_CALL_ID VARCHAR,
-    P_THRESHOLD FLOAT DEFAULT 0.6
-)
+CREATE OR REPLACE PROCEDURE EXTRACT_NEW_EMBEDDINGS(P_BATCH_SIZE NUMBER DEFAULT 100)
 RETURNS VARIANT
-LANGUAGE PYTHON
-RUNTIME_VERSION = '3.11'
-PACKAGES = ('snowflake-snowpark-python')
-HANDLER = 'auto_detect'
+LANGUAGE SQL
 EXECUTE AS OWNER
-AS $$
-import json
+AS '
+DECLARE
+    rows_updated INT := 0;
+    total_updated INT := 0;
+    batch_num INT := 0;
+    pending_count INT;
+    skipped_short INT := 0;
+BEGIN
+    -- First mark any new short contributions as skipped
+    UPDATE CALL_CONTRIBUTIONS
+    SET EMBEDDING_STATUS = ''TOO_SHORT''
+    WHERE embedding IS NULL
+    AND EMBEDDING_STATUS IS NULL
+    AND (end_time_seconds - start_time_seconds) < 0.5;
+    
+    skipped_short := SQLROWCOUNT;
 
-def auto_detect(session, p_call_id, p_threshold=0.6):
-    """Auto-detect speakers by matching contribution embeddings against voiceprints"""
-    try:
-        # Get all voiceprints
-        voiceprints = session.sql("""
-            SELECT speaker_id, speaker_name, embedding::VARCHAR as embedding
-            FROM CALL_TRANSCRIPTS_DB.TRANSCRIPTS.SPEAKER_VOICEPRINTS
-            WHERE embedding IS NOT NULL
-        """).collect()
+    LOOP
+        batch_num := batch_num + 1;
         
-        if not voiceprints:
-            return {"status": "warning", "message": "No voiceprints enrolled"}
+        -- Only get contributions without embedding AND without skip status
+        CREATE OR REPLACE TEMPORARY TABLE PENDING_BATCH AS
+        SELECT 
+            c.contribution_id,
+            c.start_time_seconds,
+            c.end_time_seconds,
+            GET_PRESIGNED_URL(
+                ''@CALL_TRANSCRIPTS_DB.TRANSCRIPTS.CALL_RECORDINGS'',
+                SPLIT_PART(cl.recording_path, ''/'', -1),
+                3600
+            ) as presigned_url
+        FROM CALL_CONTRIBUTIONS c
+        JOIN CALLS cl ON c.call_id = cl.call_id
+        WHERE c.embedding IS NULL
+        AND c.EMBEDDING_STATUS IS NULL
+        LIMIT :P_BATCH_SIZE;
         
-        # Build profiles list
-        profiles = []
-        for vp in voiceprints:
-            emb_str = vp['EMBEDDING']
-            if emb_str:
-                try:
-                    emb = json.loads(emb_str) if isinstance(emb_str, str) else emb_str
-                    profiles.append({
-                        "speaker_id": vp['SPEAKER_ID'],
-                        "speaker_name": vp['SPEAKER_NAME'],
-                        "embedding": emb
-                    })
-                except:
-                    pass
+        SELECT COUNT(*) INTO :pending_count FROM PENDING_BATCH;
         
-        if not profiles:
-            return {"status": "warning", "message": "No valid voiceprints"}
+        IF (pending_count = 0) THEN
+            RETURN OBJECT_CONSTRUCT(
+                ''status'', ''complete'', 
+                ''total_updated'', total_updated, 
+                ''batches'', batch_num - 1,
+                ''skipped_short'', skipped_short
+            );
+        END IF;
         
-        # Get call recording info
-        call_info = session.sql(f"""
-            SELECT recording_path FROM CALL_TRANSCRIPTS_DB.TRANSCRIPTS.CALLS
-            WHERE call_id = '{p_call_id}'
-        """).collect()
+        -- Extract embeddings in parallel (SQL handles parallelism)
+        CREATE OR REPLACE TEMPORARY TABLE BATCH_RESULTS AS
+        SELECT 
+            contribution_id,
+            SPEAKER_EMBEDDING_URL(presigned_url, start_time_seconds, end_time_seconds) as result
+        FROM PENDING_BATCH;
         
-        if not call_info or not call_info[0]['RECORDING_PATH']:
-            return {"status": "error", "message": "Call not found or no recording"}
+        -- Update successful extractions
+        UPDATE CALL_CONTRIBUTIONS c
+        SET EMBEDDING = PARSE_JSON(r.result:embedding)::VECTOR(FLOAT, 192),
+            EMBEDDING_STATUS = ''SUCCESS''
+        FROM BATCH_RESULTS r
+        WHERE c.contribution_id = r.contribution_id
+        AND r.result:status = ''success''
+        AND r.result:embedding IS NOT NULL;
         
-        recording_path = call_info[0]['RECORDING_PATH']
+        rows_updated := SQLROWCOUNT;
+        total_updated := total_updated + rows_updated;
         
-        # Parse stage path
-        stage_path = recording_path.lstrip('@')
-        parts = stage_path.split('/')
-        if len(parts) < 2:
-            return {"status": "error", "message": "Invalid recording path"}
+        -- Mark failed extractions
+        UPDATE CALL_CONTRIBUTIONS c
+        SET EMBEDDING_STATUS = ''FAILED''
+        FROM BATCH_RESULTS r
+        WHERE c.contribution_id = r.contribution_id
+        AND (r.result:status != ''success'' OR r.result:embedding IS NULL)
+        AND c.EMBEDDING_STATUS IS NULL;
         
-        stage_name = '@' + '/'.join(parts[:-1])
-        file_name = parts[-1]
-        
-        # Get presigned URL
-        url_result = session.sql(f"""
-            SELECT GET_PRESIGNED_URL('{stage_name}', '{file_name}', 3600) as url
-        """).collect()
-        
-        if not url_result or not url_result[0]['URL']:
-            return {"status": "error", "message": "Could not get presigned URL"}
-        
-        presigned_url = url_result[0]['URL']
-        
-        # Get unique diarization labels with their best segment
-        labels = session.sql(f"""
-            SELECT diarization_label, 
-                   MAX(duration_seconds) as max_dur,
-                   MIN(start_time_seconds) as min_start,
-                   MAX(end_time_seconds) as max_end
-            FROM CALL_TRANSCRIPTS_DB.TRANSCRIPTS.CALL_CONTRIBUTIONS
-            WHERE call_id = '{p_call_id}'
-            AND duration_seconds >= 3
-            GROUP BY diarization_label
-        """).collect()
-        
-        matched_count = 0
-        total_labels = len(labels)
-        
-        for label_row in labels:
-            diar_label = label_row['DIARIZATION_LABEL']
-            
-            # Get best segment for this label
-            best_seg = session.sql(f"""
-                SELECT start_time_seconds, end_time_seconds
-                FROM CALL_TRANSCRIPTS_DB.TRANSCRIPTS.CALL_CONTRIBUTIONS
-                WHERE call_id = '{p_call_id}'
-                AND diarization_label = '{diar_label}'
-                AND duration_seconds >= 3
-                ORDER BY duration_seconds DESC
-                LIMIT 1
-            """).collect()
-            
-            if not best_seg:
-                continue
-            
-            start_time = float(best_seg[0]['START_TIME_SECONDS'])
-            end_time = float(best_seg[0]['END_TIME_SECONDS'])
-            
-            # Extract embedding
-            emb_result = session.sql(f"""
-                SELECT SPEAKER_EMBEDDING_V9('{presigned_url}', {start_time}, {end_time}) as result
-            """).collect()
-            
-            if not emb_result or not emb_result[0]['RESULT']:
-                continue
-            
-            svc_result = emb_result[0]['RESULT']
-            if isinstance(svc_result, str):
-                svc_result = json.loads(svc_result)
-            
-            if svc_result.get('status') == 'error':
-                continue
-            
-            query_emb = svc_result.get('embedding')
-            if not query_emb:
-                continue
-            
-            if isinstance(query_emb, str):
-                query_emb = json.loads(query_emb)
-            
-            # Find best match
-            import numpy as np
-            query_vec = np.array(query_emb)
-            
-            best_score = 0.0
-            best_match = None
-            
-            for profile in profiles:
-                prof_vec = np.array(profile['embedding'])
-                score = float(np.dot(query_vec, prof_vec))
-                if score > best_score:
-                    best_score = score
-                    best_match = profile
-            
-            if best_match and best_score >= p_threshold:
-                # Update all contributions with this label
-                session.sql(f"""
-                    UPDATE CALL_TRANSCRIPTS_DB.TRANSCRIPTS.CALL_CONTRIBUTIONS
-                    SET identified_speaker_id = '{best_match["speaker_id"]}',
-                        identification_method = 'voice_embedding_auto',
-                        identification_confidence = {best_score},
-                        classification_status = 'completed'
-                    WHERE call_id = '{p_call_id}'
-                    AND diarization_label = '{diar_label}'
-                """).collect()
-                matched_count += 1
-        
-        # Update call status
-        session.sql(f"""
-            UPDATE CALL_TRANSCRIPTS_DB.TRANSCRIPTS.CALLS
-            SET classification_status = 'completed',
-                updated_at = CURRENT_TIMESTAMP()
-            WHERE call_id = '{p_call_id}'
-        """).collect()
-        
-        return {
-            "status": "success",
-            "call_id": p_call_id,
-            "total": total_labels,
-            "matched": matched_count,
-            "threshold": p_threshold
-        }
-        
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-$$;
+    END LOOP;
+END;
+';
+
+-- ============================================================================
+-- PART 9: Background Tasks
+-- ============================================================================
+
+-- Task: Hourly embedding extraction for new contributions
+CREATE OR REPLACE TASK EXTRACT_NEW_EMBEDDINGS_TASK
+    WAREHOUSE = CALL_TRANSCRIPTS_WH
+    SCHEDULE = 'USING CRON 0 * * * * UTC'
+AS
+    CALL EXTRACT_NEW_EMBEDDINGS(100);
+
+-- Task: Housekeeping - update call status and speaker meeting counts (every 5 min)
+CREATE OR REPLACE TASK SPEAKER_ASSIGNMENT_HOUSEKEEPING
+    WAREHOUSE = CALL_TRANSCRIPTS_WH
+    SCHEDULE = 'USING CRON */5 * * * * UTC'
+AS
+BEGIN
+    -- 1. Update call status for all calls based on actual data
+    UPDATE CALLS c
+    SET classification_status = 'completed'
+    WHERE classification_status != 'completed'
+    AND NOT EXISTS (
+        SELECT 1 FROM CALL_CONTRIBUTIONS cc
+        WHERE cc.call_id = c.call_id
+        AND cc.identified_speaker_id IS NULL
+    )
+    AND EXISTS (
+        SELECT 1 FROM CALL_CONTRIBUTIONS cc
+        WHERE cc.call_id = c.call_id
+    );
+    
+    -- 2. Update speaker meeting counts based on actual assignments
+    UPDATE SPEAKERS s
+    SET meeting_count = (
+        SELECT COUNT(DISTINCT call_id) 
+        FROM CALL_CONTRIBUTIONS 
+        WHERE identified_speaker_id = s.speaker_id
+        AND classification_status = 'classified'
+    ),
+    updated_at = CURRENT_TIMESTAMP;
+    
+END;
+
+-- Start the tasks
+ALTER TASK EXTRACT_NEW_EMBEDDINGS_TASK RESUME;
+ALTER TASK SPEAKER_ASSIGNMENT_HOUSEKEEPING RESUME;
 
 -- ============================================================================
 -- VERIFICATION
@@ -666,3 +702,4 @@ SELECT 'Setup complete!' as STATUS;
 SHOW TABLES IN SCHEMA CALL_TRANSCRIPTS_DB.TRANSCRIPTS;
 SHOW STAGES IN SCHEMA CALL_TRANSCRIPTS_DB.TRANSCRIPTS;
 SHOW PROCEDURES IN SCHEMA CALL_TRANSCRIPTS_DB.TRANSCRIPTS;
+SHOW TASKS IN SCHEMA CALL_TRANSCRIPTS_DB.TRANSCRIPTS;
